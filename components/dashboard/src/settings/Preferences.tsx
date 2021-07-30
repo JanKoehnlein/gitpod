@@ -53,7 +53,12 @@ export default function Preferences() {
                 We're deprecating the Theia editor. You can still switch back to Theia for the next few weeks but the preference will be removed by the end of August 2021.
             </AlertBox>
             <div className="mt-4 space-x-4 flex">
-                <SelectableCard className="w-36 h-40" title="VS Code" selected={defaultIde === 'code'} onClick={() => actuallySetDefaultIde('code')}>
+            <SelectableCard className="w-36 h-40" title="VS Code" selected={defaultIde === 'code'} onClick={() => actuallySetDefaultIde('code')}>
+                    <div className="flex-grow flex justify-center items-center">
+                        <img className="w-16 filter-grayscale" src={vscode}/>
+                    </div>
+                </SelectableCard>
+                <SelectableCard className="w-36 h-40" title="VS Code Insiders" selected={defaultIde === 'code-insiders'} onClick={() => actuallySetDefaultIde('code-insiders')}>
                     <div className="flex-grow flex justify-center items-center">
                         <img className="w-16 filter-grayscale" src={vscode}/>
                     </div>
