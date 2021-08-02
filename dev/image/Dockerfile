@@ -199,3 +199,8 @@ RUN sudo curl -fsSL https://uploader.codecov.io/latest/codecov-linux -o /usr/loc
 # Install pre-commit https://pre-commit.com/#install
 RUN sudo install-packages shellcheck \
     && sudo pip3 install pre-commit
+
+# Install Oh My ZSH
+RUN sh -c "$(wget https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh -O -)" \
+    "" \
+    --unattended
