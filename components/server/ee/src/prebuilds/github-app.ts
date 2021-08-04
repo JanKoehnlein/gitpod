@@ -106,10 +106,13 @@ export class GithubApp {
                 return;
             }
             if (action === "renamed") {
-                const project = await this.projectDB.findProjectByInstallationId(String(installation.id))
-                if (project) {
-                    project.cloneUrl = repository.clone_url;
-                    await this.projectDB.storeProject(project);
+                const oldName = (ctx.payload as any)?.changes?.repository?.name?.from;
+                if (oldName) {
+                    const project = await this.projectDB.findProjectByCloneUrl(`https://github.com/${repository.owner.login}/${oldName}.git`)
+                    if (project) {
+                        project.cloneUrl = repository.clone_url;
+                        await this.projectDB.storeProject(project);
+                    }
                 }
             }
             // TODO(at): handle deleted as well
@@ -155,7 +158,8 @@ export class GithubApp {
 
         try {
             const installationId = ctx.payload.installation?.id;
-            const owner = installationId && (await this.findInstallationOwner(installationId));
+            const cloneURL = ctx.payload.repository.clone_url;
+            const owner = installationId && (await this.findInstallationOwner(installationId, cloneURL));
             if (!owner) {
                 log.info(`No installation or associated user found.`, { repo: ctx.payload.repository, installationId });
                 return;
@@ -213,7 +217,8 @@ export class GithubApp {
 
         try {
             const installationId = ctx.payload.installation?.id;
-            const owner = installationId && (await this.findInstallationOwner(installationId));
+            const cloneURL = ctx.payload.repository.clone_url;
+            const owner = installationId && (await this.findInstallationOwner(installationId, cloneURL));
             if (!owner) {
                 log.warn("Did not find user for installation. Someone's Gitpod experience may be broken.", { repo: ctx.payload.repository, installationId });
                 return;
@@ -329,11 +334,11 @@ export class GithubApp {
         return this.env.hostUrl.with({ pathname: '/button/open-in-gitpod.svg' }).toString();
     }
 
-    protected async findInstallationOwner(installationId: number): Promise<{user: User, project?: Project} | undefined> {
+    protected async findInstallationOwner(installationId: number, cloneURL: string): Promise<{user: User, project?: Project} | undefined> {
 
         // Project mode
         //
-        const project = await this.projectDB.findProjectByInstallationId(String(installationId));
+        const project = await this.projectDB.findProjectByCloneUrl(cloneURL);
         if (project) {
             const owner = !!project.userId
                 ? { userId: project.userId }
