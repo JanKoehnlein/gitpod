@@ -42,18 +42,11 @@ export class DBUser implements User {
         identity => identity.user,
         {
             eager: true,
-            cascadeInsert: true,
-            cascadeUpdate: true
-            // , cascadeRemove: true    // In the docs but not the code???
+            cascade: ["insert", "update"],  // we do delete on our own
         }
     )
     @JoinColumn()
     identities: DBIdentity[];
-
-    @Column({
-        default: false
-    })
-    allowsMarketingCommunication: boolean;
 
     @Column({
         default: false

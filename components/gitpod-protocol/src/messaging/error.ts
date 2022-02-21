@@ -76,6 +76,9 @@ export namespace ErrorCodes {
     // 620 Team Subscription Assignment Failed
     export const TEAM_SUBSCRIPTION_ASSIGNMENT_FAILED = 620;
 
-    // 666 Not Implemented TODO IO-SPLIT remove
-    export const NOT_IMPLEMENTED = 666;
+    // 630 Snapshot Error
+    export const SNAPSHOT_ERROR = 630;
+
+    // 640 Headless logs are not available (yet)
+    export const HEADLESS_LOG_NOT_YET_AVAILABLE = 640;
 }

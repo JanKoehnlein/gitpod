@@ -8,12 +8,14 @@ import { ImageBuilderClient } from "./imgbuilder_grpc_pb";
 import { TraceContext } from '@gitpod/gitpod-protocol/lib/util/tracing';
 import { Deferred } from "@gitpod/gitpod-protocol/lib/util/deferred";
 import { log } from "@gitpod/gitpod-protocol/lib/util/logging";
+import { createClientCallMetricsInterceptor, IClientCallMetrics } from "@gitpod/content-service/lib/client-call-metrics";
 import * as opentracing from 'opentracing';
 import { Metadata } from "@grpc/grpc-js";
 import { BuildRequest, BuildResponse, BuildStatus, LogsRequest, LogsResponse, ResolveWorkspaceImageResponse, ResolveWorkspaceImageRequest, ResolveBaseImageRequest, ResolveBaseImageResponse } from "./imgbuilder_pb";
-import { injectable, inject } from 'inversify';
+import { injectable, inject, optional } from 'inversify';
 import * as grpc from "@grpc/grpc-js";
 import { TextDecoder } from "util";
+import { ImageBuildLogInfo } from "@gitpod/gitpod-protocol";
 
 export const ImageBuilderClientProvider = Symbol("ImageBuilderClientProvider");
 
@@ -33,6 +35,7 @@ function withTracing(ctx: TraceContext) {
 }
 
 export const ImageBuilderClientConfig = Symbol("ImageBuilderClientConfig");
+export const ImageBuilderClientCallMetrics = Symbol('ImageBuilderCallMetrics')
 
 // ImageBuilderClientConfig configures the access to an image builder
 export interface ImageBuilderClientConfig {
@@ -43,16 +46,36 @@ export interface ImageBuilderClientConfig {
 export class CachingImageBuilderClientProvider implements ImageBuilderClientProvider {
     @inject(ImageBuilderClientConfig) protected readonly clientConfig: ImageBuilderClientConfig;
 
-    // gRPC connections maintain their connectivity themselves, i.e. they reconnect when neccesary.
-    // They can also be used concurrently, even across services.
+    @inject(ImageBuilderClientCallMetrics) @optional()
+    protected readonly clientCallMetrics: IClientCallMetrics;
+
+    // gRPC connections can be used concurrently, even across services.
     // Thus it makes sense to cache them rather than create a new connection for each request.
     protected connectionCache: PromisifiedImageBuilderClient | undefined;
 
     getDefault() {
-        if (!this.connectionCache || !this.connectionCache.isConnectionAlive()) {
-            this.connectionCache = new PromisifiedImageBuilderClient(new ImageBuilderClient(this.clientConfig.address, grpc.credentials.createInsecure()));
+        let interceptors: grpc.Interceptor[] = [];
+        if (this.clientCallMetrics) {
+            interceptors = [ createClientCallMetricsInterceptor(this.clientCallMetrics) ];
         }
-        return this.connectionCache!;
+
+        const createClient = () => {
+            return new PromisifiedImageBuilderClient(
+                new ImageBuilderClient(this.clientConfig.address, grpc.credentials.createInsecure()),
+                interceptors
+            );
+        };
+        let connection = this.connectionCache;
+        if (!connection) {
+            connection = createClient();
+        } else if (!connection.isConnectionAlive()) {
+            connection.dispose();
+
+            connection = createClient();
+        }
+
+        this.connectionCache = connection;
+        return connection;
     }
 
 }
@@ -60,6 +83,7 @@ export class CachingImageBuilderClientProvider implements ImageBuilderClientProv
 // StagedBuildResponse captures the multi-stage nature (starting, running, done) of image builds.
 export interface StagedBuildResponse {
     buildPromise: Promise<BuildResponse>;
+    logPromise: Promise<ImageBuildLogInfo>;
 
     actuallyNeedsBuild: boolean;
     ref: string;
@@ -68,7 +92,7 @@ export interface StagedBuildResponse {
 
 export class PromisifiedImageBuilderClient {
 
-    constructor(public readonly client: ImageBuilderClient) { }
+    constructor(public readonly client: ImageBuilderClient, protected readonly interceptor: grpc.Interceptor[]) { }
 
     public isConnectionAlive() {
         const cs = this.client.getChannel().getConnectivityState(false);
@@ -78,9 +102,9 @@ export class PromisifiedImageBuilderClient {
     public resolveBaseImage(ctx: TraceContext, request: ResolveBaseImageRequest): Promise<ResolveBaseImageResponse> {
         return new Promise<ResolveBaseImageResponse>((resolve, reject) => {
             const span = TraceContext.startSpan(`/image-builder/resolveBaseImage`, ctx);
-            this.client.resolveBaseImage(request, withTracing({ span }), (err, resp) => {
+            this.client.resolveBaseImage(request, withTracing({ span }), this.getDefaultUnaryOptions(), (err, resp) => {
                 if (err) {
-                    TraceContext.logError({ span }, err);
+                    TraceContext.setError({ span }, err);
                     reject(err);
                 } else {
                     resolve(resp);
@@ -93,10 +117,10 @@ export class PromisifiedImageBuilderClient {
     public resolveWorkspaceImage(ctx: TraceContext, request: ResolveWorkspaceImageRequest): Promise<ResolveWorkspaceImageResponse> {
         return new Promise<ResolveWorkspaceImageResponse>((resolve, reject) => {
             const span = TraceContext.startSpan(`/image-builder/resolveWorkspaceImage`, ctx);
-            this.client.resolveWorkspaceImage(request, withTracing({ span }), (err, resp) => {
+            this.client.resolveWorkspaceImage(request, withTracing({ span }), this.getDefaultUnaryOptions(), (err, resp) => {
                 span.finish();
                 if (err) {
-                    TraceContext.logError({ span }, err);
+                    TraceContext.setError({ span }, err);
                     reject(err);
                 } else {
                     resolve(resp);
@@ -107,13 +131,14 @@ export class PromisifiedImageBuilderClient {
 
     // build returns a nested promise. The outer one resolves/rejects with the build start,
     // the inner one resolves/rejects when the build is done.
-    public build(ctx: TraceContext, request: BuildRequest): Promise<StagedBuildResponse> {
+    public build(ctx: TraceContext, request: BuildRequest, logInfoDeferred: Deferred<ImageBuildLogInfo> = new Deferred<ImageBuildLogInfo>()): Promise<StagedBuildResponse> {
         const span = TraceContext.startSpan(`/image-builder/build`, ctx);
 
         const buildResult = new Deferred<BuildResponse>();
 
         const result = new Deferred<StagedBuildResponse>();
         const resultResp: StagedBuildResponse = {
+            logPromise: logInfoDeferred.promise,
             buildPromise: buildResult.promise,
             actuallyNeedsBuild: true,
             ref: "unknown",
@@ -129,9 +154,10 @@ export class PromisifiedImageBuilderClient {
                     result.reject(err);
                 } else {
                     buildResult.reject(err);
+                    logInfoDeferred.reject(err);
                 }
 
-                TraceContext.logError({ span }, err);
+                TraceContext.setError({ span }, err);
                 span.finish();
             });
             stream.on('data', (resp: BuildResponse) => {
@@ -144,6 +170,22 @@ export class PromisifiedImageBuilderClient {
                     resultResp.baseRef = resp.getBaseRef();
                 }
 
+                if (resp.hasInfo()) {
+                    // assumes that log info stays stable for instance lifetime
+                    const info = resp.getInfo()
+                    if (info && info.hasLogInfo() && !logInfoDeferred.isResolved) {
+                        const logInfo = info.getLogInfo()!;
+                        const headers: { [key: string]: string } = {};
+                        for (const [k, v] of logInfo.getHeadersMap().entries()) {
+                            headers[k] = v;
+                        }
+                        logInfoDeferred.resolve({
+                            url: logInfo.getUrl(),
+                            headers,
+                        });
+                    }
+                }
+
                 if (resp.getStatus() == BuildStatus.RUNNING) {
                     resultResp.actuallyNeedsBuild = true;
                     result.resolve(resultResp);
@@ -154,6 +196,9 @@ export class PromisifiedImageBuilderClient {
                         buildResult.resolve(resp);
                     } else {
                         buildResult.resolve(resp);
+                    }
+                    if (!logInfoDeferred.isResolved) {
+                        logInfoDeferred.reject(new Error("no log stream for this image build"));
                     }
 
                     span.finish();
@@ -171,12 +216,12 @@ export class PromisifiedImageBuilderClient {
                 }
 
                 if (!spanFinished) {
-                    TraceContext.logError({ span }, err);
+                    TraceContext.setError({ span }, err);
                     span.finish();
                 }
             });
         } catch (err) {
-            TraceContext.logError({ span }, err);
+            TraceContext.setError({ span }, err);
             span.finish();
 
             log.error("failed to start image build", request);
@@ -200,6 +245,16 @@ export class PromisifiedImageBuilderClient {
                 }
             });
         })
+    }
+
+    public dispose() {
+        this.client.close();
+    }
+
+    protected getDefaultUnaryOptions(): Partial<grpc.CallOptions> {
+        return {
+            interceptors: this.interceptor,
+        }
     }
 
 }

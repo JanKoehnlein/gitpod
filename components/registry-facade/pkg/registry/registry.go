@@ -6,16 +6,16 @@ package registry
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
+	"github.com/gitpod-io/gitpod/registry-facade/api/config"
+
+	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/registry-facade/api"
 
@@ -27,61 +27,31 @@ import (
 	"github.com/docker/distribution/registry/api/errcode"
 	distv2 "github.com/docker/distribution/registry/api/v2"
 	"github.com/gorilla/mux"
-	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
-	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/keepalive"
 )
 
-// Config configures the registry
-type Config struct {
-	Port               int              `json:"port"`
-	Prefix             string           `json:"prefix"`
-	StaticLayer        []StaticLayerCfg `json:"staticLayer"`
-	RemoteSpecProvider *struct {
-		Addr string `json:"addr"`
-		TLS  *struct {
-			Authority   string `json:"ca"`
-			Certificate string `json:"crt"`
-			PrivateKey  string `json:"key"`
-		} `json:"tls,omitempty"`
-	} `json:"remoteSpecProvider,omitempty"`
-	Store       string `json:"store"`
-	RequireAuth bool   `json:"requireAuth"`
-	TLS         *struct {
-		Certificate string `json:"crt"`
-		PrivateKey  string `json:"key"`
-	} `json:"tls"`
-}
-
-// StaticLayerCfg configure statically added layer
-type StaticLayerCfg struct {
-	Ref  string `json:"ref"`
-	Type string `json:"type"`
-}
-
 // BuildStaticLayer builds a layer set from a static layer configuration
-func buildStaticLayer(ctx context.Context, cfg []StaticLayerCfg, newResolver ResolverProvider) (CompositeLayerSource, error) {
+func buildStaticLayer(ctx context.Context, cfg []config.StaticLayerCfg, newResolver ResolverProvider) (CompositeLayerSource, error) {
 	var l CompositeLayerSource
 	for _, sl := range cfg {
 		switch sl.Type {
 		case "file":
 			src, err := NewFileLayerSource(ctx, sl.Ref)
 			if err != nil {
-				return nil, fmt.Errorf("cannot source layer from %s: %w", sl.Ref, err)
+				return nil, xerrors.Errorf("cannot source layer from %s: %w", sl.Ref, err)
 			}
 			l = append(l, src)
 		case "image":
 			src, err := NewStaticSourceFromImage(ctx, newResolver(), sl.Ref)
 			if err != nil {
-				return nil, fmt.Errorf("cannot source layer from %s: %w", sl.Ref, err)
+				return nil, xerrors.Errorf("cannot source layer from %s: %w", sl.Ref, err)
 			}
 			l = append(l, src)
 		default:
-			return nil, fmt.Errorf("unknown static layer type: %s", sl.Type)
+			return nil, xerrors.Errorf("unknown static layer type: %s", sl.Type)
 		}
 	}
 	return l, nil
@@ -92,7 +62,7 @@ type ResolverProvider func() remotes.Resolver
 
 // Registry acts as registry facade
 type Registry struct {
-	Config         Config
+	Config         config.Config
 	Resolver       ResolverProvider
 	Store          content.Store
 	LayerSource    LayerSource
@@ -105,7 +75,7 @@ type Registry struct {
 }
 
 // NewRegistry creates a new registry
-func NewRegistry(cfg Config, newResolver ResolverProvider, reg prometheus.Registerer) (*Registry, error) {
+func NewRegistry(cfg config.Config, newResolver ResolverProvider, reg prometheus.Registerer) (*Registry, error) {
 	storePath := cfg.Store
 	if tproot := os.Getenv("TELEPRESENCE_ROOT"); tproot != "" {
 		storePath = filepath.Join(tproot, storePath)
@@ -126,15 +96,7 @@ func NewRegistry(cfg Config, newResolver ResolverProvider, reg prometheus.Regist
 
 	var layerSources []LayerSource
 
-	ideRefSource := func(s *api.ImageSpec) (ref string, err error) {
-		return s.IdeRef, nil
-	}
-	ideLayerSource, err := NewSpecMappedImageSource(newResolver, ideRefSource)
-	if err != nil {
-		return nil, err
-	}
-	layerSources = append(layerSources, ideLayerSource)
-
+	// static layers
 	log.Info("preparing static layer")
 	staticLayer := NewRevisioningLayerSource(CompositeLayerSource{})
 	layerSources = append(layerSources, staticLayer)
@@ -145,6 +107,38 @@ func NewRegistry(cfg Config, newResolver ResolverProvider, reg prometheus.Regist
 		}
 		staticLayer.Update(l)
 	}
+
+	// IDE layer
+	ideRefSource := func(s *api.ImageSpec) (ref string, err error) {
+		return s.IdeRef, nil
+	}
+	ideLayerSource, err := NewSpecMappedImageSource(newResolver, ideRefSource)
+	if err != nil {
+		return nil, err
+	}
+	layerSources = append(layerSources, ideLayerSource)
+
+	// desktop IDE layer
+	desktopIdeRefSource := func(s *api.ImageSpec) (ref string, err error) {
+		return s.DesktopIdeRef, nil
+	}
+	desktopIdeLayerSource, err := NewSpecMappedImageSource(newResolver, desktopIdeRefSource)
+	if err != nil {
+		return nil, err
+	}
+	layerSources = append(layerSources, desktopIdeLayerSource)
+
+	// supervisor layer
+	supervisorRefSource := func(s *api.ImageSpec) (ref string, err error) {
+		return s.SupervisorRef, nil
+	}
+	supervisorLayerSource, err := NewSpecMappedImageSource(newResolver, supervisorRefSource)
+	if err != nil {
+		return nil, err
+	}
+	layerSources = append(layerSources, supervisorLayerSource)
+
+	// content layer
 	clsrc, err := NewContentLayerSource()
 	if err != nil {
 		return nil, xerrors.Errorf("cannot create content layer source: %w", err)
@@ -153,61 +147,24 @@ func NewRegistry(cfg Config, newResolver ResolverProvider, reg prometheus.Regist
 
 	specProvider := map[string]ImageSpecProvider{}
 	if cfg.RemoteSpecProvider != nil {
-		opts := []grpc.DialOption{
-			grpc.WithUnaryInterceptor(grpc_opentracing.UnaryClientInterceptor(grpc_opentracing.WithTracer(opentracing.GlobalTracer()))),
-			grpc.WithStreamInterceptor(grpc_opentracing.StreamClientInterceptor(grpc_opentracing.WithTracer(opentracing.GlobalTracer()))),
-			grpc.WithBlock(),
-			grpc.WithBackoffMaxDelay(5 * time.Second),
-			grpc.WithKeepaliveParams(keepalive.ClientParameters{
-				Time:                5 * time.Second,
-				Timeout:             time.Second,
-				PermitWithoutStream: true,
-			}),
-		}
-
+		grpcOpts := common_grpc.DefaultClientOptions()
 		if cfg.RemoteSpecProvider.TLS != nil {
-			ca := cfg.RemoteSpecProvider.TLS.Authority
-			crt := cfg.RemoteSpecProvider.TLS.Certificate
-			key := cfg.RemoteSpecProvider.TLS.PrivateKey
-
-			// Telepresence (used for debugging only) requires special paths to load files from
-			if root := os.Getenv("TELEPRESENCE_ROOT"); root != "" {
-				ca = filepath.Join(root, ca)
-				crt = filepath.Join(root, crt)
-				key = filepath.Join(root, key)
-			}
-
-			rootCA, err := os.ReadFile(ca)
-			if err != nil {
-				return nil, xerrors.Errorf("could not read ca certificate: %s", err)
-			}
-			certPool := x509.NewCertPool()
-			if ok := certPool.AppendCertsFromPEM(rootCA); !ok {
-				return nil, xerrors.Errorf("failed to append ca certs")
-			}
-
-			certificate, err := tls.LoadX509KeyPair(crt, key)
+			tlsConfig, err := common_grpc.ClientAuthTLSConfig(
+				cfg.RemoteSpecProvider.TLS.Authority, cfg.RemoteSpecProvider.TLS.Certificate, cfg.RemoteSpecProvider.TLS.PrivateKey,
+				common_grpc.WithSetRootCAs(true),
+				common_grpc.WithServerName("ws-manager"),
+			)
 			if err != nil {
 				log.WithField("config", cfg.TLS).Error("Cannot load ws-manager certs - this is a configuration issue.")
 				return nil, xerrors.Errorf("cannot load ws-manager certs: %w", err)
 			}
 
-			creds := credentials.NewTLS(&tls.Config{
-				Certificates: []tls.Certificate{certificate},
-				RootCAs:      certPool,
-				MinVersion:   tls.VersionTLS12,
-			})
-			opts = append(opts, grpc.WithTransportCredentials(creds))
-			log.
-				WithField("ca", ca).
-				WithField("cert", crt).
-				WithField("key", key).
-				Debug("using TLS config to connect ws-manager")
+			grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 		} else {
-			opts = append(opts, grpc.WithInsecure())
+			grpcOpts = append(grpcOpts, grpc.WithInsecure())
 		}
 
-		specprov, err := NewCachingSpecProvider(128, NewRemoteSpecProvider(cfg.RemoteSpecProvider.Addr, opts))
+		specprov, err := NewCachingSpecProvider(128, NewRemoteSpecProvider(cfg.RemoteSpecProvider.Addr, grpcOpts))
 		if err != nil {
 			return nil, xerrors.Errorf("cannot create caching spec provider: %w", err)
 		}
@@ -228,7 +185,7 @@ func NewRegistry(cfg Config, newResolver ResolverProvider, reg prometheus.Regist
 }
 
 // UpdateStaticLayer updates the static layer a registry-facade adds
-func (reg *Registry) UpdateStaticLayer(ctx context.Context, cfg []StaticLayerCfg) error {
+func (reg *Registry) UpdateStaticLayer(ctx context.Context, cfg []config.StaticLayerCfg) error {
 	l, err := buildStaticLayer(ctx, cfg, reg.Resolver)
 	if err != nil {
 		return err
@@ -406,9 +363,7 @@ func (ctx *muxVarsContext) Value(key interface{}) interface{} {
 			return ctx.vars
 		}
 
-		if strings.HasPrefix(keyStr, "vars.") {
-			keyStr = strings.TrimPrefix(keyStr, "vars.")
-		}
+		keyStr = strings.TrimPrefix(keyStr, "vars.")
 
 		if v, ok := ctx.vars[keyStr]; ok {
 			return v

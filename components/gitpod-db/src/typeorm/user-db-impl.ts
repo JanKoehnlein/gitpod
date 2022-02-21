@@ -10,8 +10,8 @@ import { EncryptionService } from "@gitpod/gitpod-protocol/lib/encryption/encryp
 import { DateInterval, ExtraAccessTokenFields, GrantIdentifier, OAuthClient, OAuthScope, OAuthToken, OAuthUser } from "@jmondi/oauth2-server";
 import { inject, injectable, postConstruct } from "inversify";
 import { EntityManager, Repository } from "typeorm";
-import * as uuidv4 from 'uuid/v4';
-import { BUILTIN_WORKSPACE_PROBE_USER_NAME, MaybeUser, PartialUserUpdate, UserDB } from "../user-db";
+import { v4 as uuidv4 } from 'uuid';
+import { BUILTIN_WORKSPACE_PROBE_USER_ID, MaybeUser, PartialUserUpdate, UserDB } from "../user-db";
 import { DBGitpodToken } from "./entity/db-gitpod-token";
 import { DBIdentity } from "./entity/db-identity";
 import { DBTokenEntry } from "./entity/db-token-entry";
@@ -19,6 +19,7 @@ import { DBUser } from './entity/db-user';
 import { DBUserEnvVar } from "./entity/db-user-env-vars";
 import { DBWorkspace } from "./entity/db-workspace";
 import { TypeORM } from './typeorm';
+import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
 
 // OAuth token expiry
 const tokenExpiryInFuture = new DateInterval("7d");
@@ -77,8 +78,10 @@ export class TypeORMUserDBImpl implements UserDB {
             id: uuidv4(),
             creationDate: new Date().toISOString(),
             identities: [],
-            allowsMarketingCommunication: true,
-            additionalData: { ideSettings: { defaultIde: 'code' } },
+            additionalData: {
+                ideSettings: { defaultIde: 'code' },
+                emailNotificationSettings: { allowsChangelogMail: true, allowsDevXMail: true, allowsOnboardingMail: true }
+            },
         };
         await this.storeUser(user);
         return user;
@@ -90,14 +93,18 @@ export class TypeORMUserDBImpl implements UserDB {
         return await userRepo.save(dbUser);
     }
 
-    public async updateUserPartial(partial: PartialUserUpdate): Promise<void> {
+    public async updateUserPartial(_partial: PartialUserUpdate): Promise<void> {
         const userRepo = await this.getUserRepo();
-        await userRepo.updateById(partial.id, partial);
+        const partial = { ..._partial };
+        // .update does not update across one-to-many relations, which is also not what we want here (see type PartialUserUpdate)
+        // Still, sometimes it's convenient to pass in a full-blown "User" here. To make that work as expected, we're ignoring "identities" here.
+        delete (partial as any).identities;
+        await userRepo.update(partial.id, partial);
     }
 
     public async findUserById(id: string): Promise<MaybeUser> {
         const userRepo = await this.getUserRepo();
-        return userRepo.findOneById(id);
+        return userRepo.findOne(id);
     }
 
     public async findUserByIdentity(identity: IdentityLookup): Promise<User | undefined> {
@@ -172,6 +179,14 @@ export class TypeORMUserDBImpl implements UserDB {
         return { user: token.user, token };
     }
 
+    public async findGitpodTokensOfUser(userId: string, tokenHash: string): Promise<GitpodToken | undefined> {
+        const repo = await this.getGitpodTokenRepo()
+        const qBuilder = repo.createQueryBuilder('gitpodToken')
+            .leftJoinAndSelect("gitpodToken.user", "user");
+        qBuilder.where('user.id = :userId AND gitpodToken.tokenHash = :tokenHash', { userId, tokenHash });
+        return qBuilder.getOne();
+    }
+
     public async findAllGitpodTokensOfUser(userId: string): Promise<GitpodToken[]> {
         const repo = await this.getGitpodTokenRepo()
         const qBuilder = repo.createQueryBuilder('gitpodToken')
@@ -233,12 +248,12 @@ export class TypeORMUserDBImpl implements UserDB {
 
     public async findTokenEntryById(uid: string): Promise<TokenEntry | undefined> {
         const repo = await this.getTokenRepo();
-        return repo.findOneById(uid);
+        return repo.findOne(uid);
     }
 
     public async deleteTokenEntryById(uid: string): Promise<void> {
         const repo = await this.getTokenRepo();
-        await repo.deleteById(uid);
+        await repo.delete(uid);
     }
 
     public async deleteExpiredTokenEntries(date: string): Promise<void> {
@@ -254,7 +269,7 @@ export class TypeORMUserDBImpl implements UserDB {
 
     public async updateTokenEntry(tokenEntry: Partial<TokenEntry> & Pick<TokenEntry, "uid">): Promise<void> {
         const repo = await this.getTokenRepo();
-        await repo.updateById(tokenEntry.uid, tokenEntry);
+        await repo.update(tokenEntry.uid, tokenEntry);
     }
 
     public async deleteTokens(identity: Identity, shouldDelete?: (entry: TokenEntry) => boolean): Promise<void> {
@@ -271,12 +286,12 @@ export class TypeORMUserDBImpl implements UserDB {
     public async findTokenForIdentity(identity: Identity): Promise<Token | undefined> {
         const tokenEntries = await this.findTokensForIdentity(identity);
         if (tokenEntries.length > 1) {
-            throw new Error(`Found more than one active token for ${identity.authProviderId} and user ${identity.authName}`);
+            log.warn(`Found more than one active token for ${identity.authProviderId}.`, { identity });
         }
         if (tokenEntries.length === 0) {
             return undefined;
         }
-        return tokenEntries[0].token;
+        return tokenEntries.sort((a, b) => `${a.token.updateDate}`.localeCompare(`${b.token.updateDate}`)).reverse()[0]?.token;
     }
 
     public async findTokensForIdentity(identity: Identity, includeDeleted?: boolean): Promise<TokenEntry[]> {
@@ -300,11 +315,11 @@ export class TypeORMUserDBImpl implements UserDB {
             WHERE markedDeleted != true`;
         if (excludeBuiltinUsers) {
             query = `${query}
-                AND name <> '${BUILTIN_WORKSPACE_PROBE_USER_NAME}'`
+                AND id <> '${BUILTIN_WORKSPACE_PROBE_USER_ID}'`
         }
         const res = await userRepo.query(query);
         const count = res[0].cnt;
-        return count;
+        return Number.parseInt(count);
     }
 
     public async setEnvVar(envVar: UserEnvVar): Promise<void> {
@@ -344,7 +359,7 @@ export class TypeORMUserDBImpl implements UserDB {
             qBuilder.andWhere("user.creationDate < :maxCreationDate", { maxCreationDate: maxCreationDate.toISOString() });
         }
         if (excludeBuiltinUsers) {
-            qBuilder.andWhere("user.name <> :username", { username: BUILTIN_WORKSPACE_PROBE_USER_NAME })
+            qBuilder.andWhere("user.id <> :userId", { userId: BUILTIN_WORKSPACE_PROBE_USER_ID })
         }
         qBuilder.orderBy("user." + orderBy, orderDir);
         qBuilder.skip(offset).take(limit).select();
@@ -405,7 +420,8 @@ export class TypeORMUserDBImpl implements UserDB {
             // We do not allow changes of name, type, user or scope.
             dbToken = userAndToken.token as GitpodToken & { user: DBUser };
             const repo = await this.getGitpodTokenRepo();
-            return repo.updateById(tokenHash, dbToken);
+            await repo.update(tokenHash, dbToken);
+            return;
         } else {
             var user: MaybeUser;
             if (accessToken.user) {

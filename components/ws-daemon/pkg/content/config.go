@@ -5,13 +5,14 @@
 package content
 
 import (
-	"fmt"
+	"encoding/json"
 	"strings"
 
 	"github.com/gitpod-io/gitpod/common-go/util"
-	"github.com/gitpod-io/gitpod/content-service/pkg/storage"
+	cntntcfg "github.com/gitpod-io/gitpod/content-service/api/config"
 	"github.com/gitpod-io/gitpod/ws-daemon/api"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/quota"
+	"golang.org/x/xerrors"
 )
 
 // Config configures the workspace content service
@@ -32,38 +33,46 @@ type Config struct {
 	WorkspaceSizeLimit quota.Size `json:"workspaceSizeLimit"`
 
 	// Storage is some form of permanent file store to which we back up workspaces
-	Storage storage.Config `json:"storage"`
+	Storage cntntcfg.StorageConfig `json:"storage"`
 
 	// Backup configures the behaviour of ws-daemon during backup
-	Backup struct {
-		// Timeout configures the maximum time the remote storage upload can take
-		// per attempt. Defaults to 10 minutes.
-		Timeout util.Duration `json:"timeout,omitempty"`
-
-		// Attempts configures how many backup attempts we will make.
-		// Detaults to 3
-		Attempts int `json:"attempts"`
-
-		// Period is the time between regular workspace backups
-		Period util.Duration `json:"period"`
-	} `json:"backup,omitempty"`
+	Backup BackupConfig `json:"backup,omitempty"`
 
 	// UserNamespaces configures the behaviour of the user-namespace support
-	UserNamespaces struct {
-		FSShift FSShiftMethod `json:"fsShift"`
-	} `json:"userNamespaces,omitempty"`
+	UserNamespaces UserNamespacesConfig `json:"userNamespaces,omitempty"`
 
 	// Initializer configures the isolated content initializer runtime
-	Initializer struct {
-		// Command is the path to content-initializer executable
-		Command string `json:"command"`
+	Initializer InitializerConfig `json:"initializer"`
+}
 
-		// Args are additional arguments to pass to the CI runtime
-		Args []string `json:"args"`
-	} `json:"initializer"`
+type BackupConfig struct {
+	// Timeout configures the maximum time the remote storage upload can take
+	// per attempt. Defaults to 10 minutes.
+	Timeout util.Duration `json:"timeout,omitempty"`
+
+	// Attempts configures how many backup attempts we will make.
+	// Detaults to 3
+	Attempts int `json:"attempts"`
+
+	// Period is the time between regular workspace backups
+	Period util.Duration `json:"period"`
+}
+
+type UserNamespacesConfig struct {
+	FSShift FSShiftMethod `json:"fsShift"`
 }
 
 type FSShiftMethod api.FSShiftMethod
+
+// MarshalJSON marshals the api.FSShiftMethod to the api.FSShiftMethod_value
+func (m FSShiftMethod) MarshalJSON() ([]byte, error) {
+	methodInt := int32(m)
+	v, ok := api.FSShiftMethod_name[methodInt]
+	if !ok {
+		return nil, xerrors.Errorf("invalid shift method: %i", methodInt)
+	}
+	return json.Marshal(v)
+}
 
 // UnmarshalJSON unmarshals the lowercase shift method string as defined in
 // api.FSShiftMethod_value to api.FSShiftMethod
@@ -71,8 +80,16 @@ func (m *FSShiftMethod) UnmarshalJSON(data []byte) error {
 	input := strings.ToUpper(strings.Trim(string(data), "\""))
 	v, ok := api.FSShiftMethod_value[input]
 	if !ok {
-		return fmt.Errorf("invalid shift method: %v", input)
+		return xerrors.Errorf("invalid shift method: %v", input)
 	}
 	*m = FSShiftMethod(v)
 	return nil
+}
+
+type InitializerConfig struct {
+	// Command is the path to content-initializer executable
+	Command string `json:"command"`
+
+	// Args are additional arguments to pass to the CI runtime
+	Args []string `json:"args"`
 }

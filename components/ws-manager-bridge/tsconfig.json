@@ -5,6 +5,7 @@
         "outDir": "dist",
         "lib": [
             "es6",
+            "es2017",
             "esnext.asynciterable"
         ],
         "strict": true,
@@ -15,12 +16,13 @@
         "downlevelIteration": true,
         "module": "commonjs",
         "moduleResolution": "node",
-        "target": "es5",
+        "target": "es2017",
         "jsx": "react",
         "sourceMap": true,
         "declaration": true,
         "declarationMap": true,
-        "skipLibCheck": true
+        "skipLibCheck": true,
+        "useUnknownInCatchVariables": false
     },
     "include": [
         "src",

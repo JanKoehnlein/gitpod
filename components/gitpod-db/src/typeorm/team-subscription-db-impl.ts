@@ -41,13 +41,14 @@ export class TeamSubscriptionDBImpl implements TeamSubscriptionDB {
      * Team Subscriptions
      */
 
-    async storeTeamSubscriptionEntry(ts: TeamSubscription): Promise<TeamSubscription> {
-        return (await this.getRepo()).save(ts);
+    async storeTeamSubscriptionEntry(ts: TeamSubscription): Promise<void> {
+        const repo = await this.getRepo();
+        await repo.save(ts);
     }
 
     async findTeamSubscriptionById(id: string): Promise<TeamSubscription | undefined> {
         const repo = await this.getRepo();
-        return repo.findOneById(id);
+        return repo.findOne(id);
     }
 
     async findTeamSubscriptionByPaymentRef(userId: string, paymentReference: string): Promise<TeamSubscription | undefined> {
@@ -86,7 +87,7 @@ export class TeamSubscriptionDBImpl implements TeamSubscriptionDB {
 
     async findSlotById(id: string): Promise<TeamSubscriptionSlot | undefined> {
         const repo = await this.getSlotsRepo();
-        return repo.findOneById(id);
+        return repo.findOne(id);
     }
 
     async findSlotsByTeamSubscriptionId(teamSubscriptionId: string): Promise<TeamSubscriptionSlot[]> {

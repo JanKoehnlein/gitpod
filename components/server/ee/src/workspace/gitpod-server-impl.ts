@@ -5,23 +5,20 @@
  */
 
 import { injectable, inject } from "inversify";
-import { GitpodServerImpl } from "../../../src/workspace/gitpod-server-impl";
+import { GitpodServerImpl, traceAPIParams, traceWI, censor } from "../../../src/workspace/gitpod-server-impl";
 import { TraceContext } from "@gitpod/gitpod-protocol/lib/util/tracing";
-import { GitpodServer, GitpodClient, AdminGetListRequest, User, AdminGetListResult, Permission, AdminBlockUserRequest, AdminModifyRoleOrPermissionRequest, RoleOrPermission, AdminModifyPermanentWorkspaceFeatureFlagRequest, UserFeatureSettings, AdminGetWorkspacesRequest, WorkspaceAndInstance, GetWorkspaceTimeoutResult, WorkspaceTimeoutDuration, WorkspaceTimeoutValues, SetWorkspaceTimeoutResult, WorkspaceContext, CreateWorkspaceMode, WorkspaceCreationResult, PrebuiltWorkspaceContext, CommitContext, PrebuiltWorkspace, PermissionName, WorkspaceInstance, EduEmailDomain, ProviderRepository, Queue } from "@gitpod/gitpod-protocol";
+import { GitpodServer, GitpodClient, AdminGetListRequest, User, Team, AdminGetListResult, Permission, AdminBlockUserRequest, AdminModifyRoleOrPermissionRequest, RoleOrPermission, AdminModifyPermanentWorkspaceFeatureFlagRequest, UserFeatureSettings, AdminGetWorkspacesRequest, WorkspaceAndInstance, GetWorkspaceTimeoutResult, WorkspaceTimeoutDuration, WorkspaceTimeoutValues, SetWorkspaceTimeoutResult, WorkspaceContext, CreateWorkspaceMode, WorkspaceCreationResult, PrebuiltWorkspaceContext, CommitContext, PrebuiltWorkspace, WorkspaceInstance, EduEmailDomain, ProviderRepository, Queue, PrebuildWithStatus, CreateProjectParams, Project, StartPrebuildResult, ClientHeaderFields, Workspace, FindPrebuildsParams } from "@gitpod/gitpod-protocol";
 import { ResponseError } from "vscode-jsonrpc";
 import { TakeSnapshotRequest, AdmissionLevel, ControlAdmissionRequest, StopWorkspacePolicy, DescribeWorkspaceRequest, SetTimeoutRequest } from "@gitpod/ws-manager/lib";
 import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
-import * as opentracing from 'opentracing';
-import * as uuidv4 from 'uuid/v4';
+import { v4 as uuidv4 } from 'uuid';
 import { log, LogContext } from "@gitpod/gitpod-protocol/lib/util/logging";
 import { LicenseEvaluator, LicenseKeySource } from "@gitpod/licensor/lib";
 import { Feature } from "@gitpod/licensor/lib/api";
-import { LicenseValidationResult, GetLicenseInfoResult, LicenseFeature } from '@gitpod/gitpod-protocol/lib/license-protocol';
+import { LicenseValidationResult, LicenseFeature } from '@gitpod/gitpod-protocol/lib/license-protocol';
 import { PrebuildManager } from "../prebuilds/prebuild-manager";
 import { LicenseDB } from "@gitpod/gitpod-db/lib";
 import { ResourceAccessGuard } from "../../../src/auth/resource-access";
-import { MessageBusIntegration } from "../../../src/workspace/messagebus-integration";
-import { MessageBusIntegrationEE } from "./messagebus-integration";
 import { AccountStatement, CreditAlert, Subscription } from "@gitpod/gitpod-protocol/lib/accounting-protocol";
 import { EligibilityService } from "../user/eligibility-service";
 import { AccountStatementProvider } from "../user/account-statement-provider";
@@ -37,18 +34,21 @@ import { ChargebeeProvider, UpgradeHelper } from "@gitpod/gitpod-payment-endpoin
 import { ChargebeeCouponComputer } from "../user/coupon-computer";
 import { ChargebeeService } from "../user/chargebee-service";
 import { Chargebee as chargebee } from '@gitpod/gitpod-payment-endpoint/lib/chargebee';
-import { EnvEE } from "../env";
 
 import { GitHubAppSupport } from "../github/github-app-support";
+import { GitLabAppSupport } from "../gitlab/gitlab-app-support";
+import { Config } from "../../../src/config";
+import { SnapshotService, WaitForSnapshotOptions } from "./snapshot-service";
+import { ClientMetadata, traceClientMetadata } from "../../../src/websocket/websocket-connection-manager";
+import { BitbucketAppSupport } from "../bitbucket/bitbucket-app-support";
+import { URL } from 'url';
 
 @injectable()
-export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodServer> {
+export class GitpodServerEEImpl extends GitpodServerImpl {
     @inject(LicenseEvaluator) protected readonly licenseEvaluator: LicenseEvaluator;
     @inject(PrebuildManager) protected readonly prebuildManager: PrebuildManager;
     @inject(LicenseDB) protected readonly licenseDB: LicenseDB;
     @inject(LicenseKeySource) protected readonly licenseKeySource: LicenseKeySource;
-
-    @inject(MessageBusIntegration) protected readonly messageBusIntegration: MessageBusIntegrationEE;
 
     // per-user state
     @inject(EligibilityService) protected readonly eligibilityService: EligibilityService;
@@ -68,12 +68,52 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
     @inject(ChargebeeService) protected readonly chargebeeService: ChargebeeService;
 
     @inject(GitHubAppSupport) protected readonly githubAppSupport: GitHubAppSupport;
+    @inject(GitLabAppSupport) protected readonly gitLabAppSupport: GitLabAppSupport;
+    @inject(BitbucketAppSupport) protected readonly bitbucketAppSupport: BitbucketAppSupport;
 
-    @inject(EnvEE) protected readonly env: EnvEE;
+    @inject(Config) protected readonly config: Config;
 
-    initialize(client: GitpodClient | undefined, clientRegion: string | undefined, user: User, accessGuard: ResourceAccessGuard): void {
-        super.initialize(client, clientRegion, user, accessGuard);
+    @inject(SnapshotService) protected readonly snapshotService: SnapshotService;
+
+    initialize(client: GitpodClient | undefined, user: User | undefined, accessGuard: ResourceAccessGuard, clientMetadata: ClientMetadata, connectionCtx: TraceContext | undefined, clientHeaderFields: ClientHeaderFields): void {
+        super.initialize(client, user, accessGuard, clientMetadata, connectionCtx, clientHeaderFields);
+
         this.listenToCreditAlerts();
+        this.listenForPrebuildUpdates()
+            .catch(err => log.error("error registering for prebuild updates", err));
+    }
+
+    protected async listenForPrebuildUpdates() {
+        // 'registering for prebuild updates for all projects this user has access to
+        const projects = await this.getAccessibleProjects();
+        for (const projectId of projects) {
+            this.disposables.push(this.localMessageBroker.listenForPrebuildUpdates(
+                projectId,
+                (ctx: TraceContext, update: PrebuildWithStatus) => TraceContext.withSpan("forwardPrebuildUpdateToClient", (ctx) => {
+                    traceClientMetadata(ctx, this.clientMetadata);
+                    TraceContext.setJsonRPCMetadata(ctx, "onPrebuildUpdate");
+
+                    this.client?.onPrebuildUpdate(update);
+                }, ctx)
+            ));
+        }
+
+        // TODO(at) we need to keep the list of accessible project up to date
+    }
+
+    protected async getAccessibleProjects() {
+        if (!this.user) {
+            return [];
+        }
+
+        // update all project this user has access to
+        const allProjects: string[] = [];
+        const teams = await this.teamDB.findTeamsByUser(this.user.id);
+        for (const team of teams) {
+            allProjects.push(...(await this.projectsService.getTeamProjects(team.id)).map(p => p.id));
+        }
+        allProjects.push(...(await this.projectsService.getUserProjects(this.user.id)).map(p => p.id));
+        return allProjects;
     }
 
     /**
@@ -83,53 +123,32 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         if (!this.user || !this.client) {
             return;
         }
-        this.disposables.push(this.messageBusIntegration.listenToCreditAlerts(
+        this.disposables.push(this.localMessageBroker.listenToCreditAlerts(
             this.user.id,
-            async (ctx: TraceContext, creditAlert: CreditAlert) => {
-                this.client?.onCreditAlert(creditAlert);
-                if (creditAlert.remainingUsageHours < 1e-6) {
-                    const runningInstances = await this.workspaceDb.trace({}).findRegularRunningInstances(creditAlert.userId);
-                    runningInstances.forEach(async instance => await this.stopWorkspace(instance.workspaceId));
-                }
-            }
-        ))
-    }
+            (ctx: TraceContext, creditAlert: CreditAlert) => {
+                TraceContext.withSpan("forwardCreditAlertToClient", async (ctx) => {
+                    traceClientMetadata(ctx, this.clientMetadata);
+                    TraceContext.setJsonRPCMetadata(ctx, "onCreditAlert");
 
-    // eligibility checks and extension points
-    public async mayAccessPrivateRepo(): Promise<boolean> {
-        const user = this.checkAndBlockUser("mayAccessPrivateRepo");
-        return this.eligibilityService.mayOpenPrivateRepo(user, new Date());
+                    this.client?.onCreditAlert(creditAlert);
+                    if (creditAlert.remainingUsageHours < 1e-6) {
+                        const runningInstances = await this.workspaceDb.trace(ctx).findRegularRunningInstances(creditAlert.userId);
+                        runningInstances.forEach(async instance => await this.stopWorkspace(ctx, instance.workspaceId));
+                    }
+                }, ctx);
+            }
+        ));
     }
 
     protected async mayStartWorkspace(ctx: TraceContext, user: User, runningInstances: Promise<WorkspaceInstance[]>): Promise<void> {
         await super.mayStartWorkspace(ctx, user, runningInstances);
 
-        const span = TraceContext.startSpan("mayStartWorkspace", ctx);
-
-        try {
-            const result = await this.eligibilityService.mayStartWorkspace(user, new Date(), runningInstances);
-            if (!result.enoughCredits) {
-                throw new ResponseError(ErrorCodes.NOT_ENOUGH_CREDIT, `Not enough credits. Please book more.`);
-            }
-            if (!!result.hitParallelWorkspaceLimit) {
-                throw new ResponseError(ErrorCodes.TOO_MANY_RUNNING_WORKSPACES, `You cannot run more than ${result.hitParallelWorkspaceLimit.max} workspaces at the same time. Please stop a workspace before starting another one.`);
-            }
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
+        const result = await this.eligibilityService.mayStartWorkspace(user, new Date(), runningInstances);
+        if (!result.enoughCredits) {
+            throw new ResponseError(ErrorCodes.NOT_ENOUGH_CREDIT, `Not enough credits. Please book more.`);
         }
-    }
-
-
-
-    protected async mayOpenContext(user: User, context: WorkspaceContext): Promise<void> {
-        await super.mayOpenContext(user, context);
-
-        const mayOpenContext = await this.eligibilityService.mayOpenContext(user, context, new Date())
-        if (!mayOpenContext) {
-            throw new ResponseError(ErrorCodes.PLAN_DOES_NOT_ALLOW_PRIVATE_REPOS, `You do not have a plan that allows for opening private repositories.`);
+        if (!!result.hitParallelWorkspaceLimit) {
+            throw new ResponseError(ErrorCodes.TOO_MANY_RUNNING_WORKSPACES, `You cannot run more than ${result.hitParallelWorkspaceLimit.max} workspaces at the same time. Please stop a workspace before starting another one.`);
         }
     }
 
@@ -139,7 +158,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         }
     }
 
-    async validateLicense(): Promise<LicenseValidationResult> {
+    async validateLicense(ctx: TraceContext): Promise<LicenseValidationResult> {
         const v = this.licenseEvaluator.validate();
         if (!v.valid) {
             return v;
@@ -158,121 +177,97 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         return { valid: true };
     }
 
-    public async setWorkspaceTimeout(workspaceId: string, duration: WorkspaceTimeoutDuration): Promise<SetWorkspaceTimeoutResult> {
+    public async setWorkspaceTimeout(ctx: TraceContext, workspaceId: string, duration: WorkspaceTimeoutDuration): Promise<SetWorkspaceTimeoutResult> {
+        traceAPIParams(ctx, { workspaceId, duration });
+        traceWI(ctx, { workspaceId });
+
         this.requireEELicense(Feature.FeatureSetTimeout);
-
         const user = this.checkUser("setWorkspaceTimeout");
-        const span = opentracing.globalTracer().startSpan("setWorkspaceTimeout");
-        span.setTag("workspaceId", workspaceId);
-        span.setTag("userId", user.id);
-        span.setTag("duration", duration);
 
-        try {
-            if (!WorkspaceTimeoutValues.includes(duration)) {
-                throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "Invalid duration")
-            }
+        if (!WorkspaceTimeoutValues.includes(duration)) {
+            throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "Invalid duration")
+        }
 
-            if (!(await this.maySetTimeout(user))) {
-                throw new ResponseError(ErrorCodes.PLAN_PROFESSIONAL_REQUIRED, "Plan upgrade is required")
-            }
+        if (!(await this.maySetTimeout(user))) {
+            throw new ResponseError(ErrorCodes.PLAN_PROFESSIONAL_REQUIRED, "Plan upgrade is required")
+        }
 
-            const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace({ span }));
-            const runningInstances = await this.workspaceDb.trace({ span }).findRegularRunningInstances(user.id);
-            const runningInstance = runningInstances.find(i => i.workspaceId === workspaceId);
-            if (!runningInstance) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, "Can only set keep-alive for running workspaces");
-            }
-            await this.guardAccess({ kind: "workspaceInstance", subject: runningInstance, workspaceOwnerID: workspace.ownerId, workspaceIsShared: workspace.shareable || false }, "update");
+        const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace(ctx));
+        const runningInstances = await this.workspaceDb.trace(ctx).findRegularRunningInstances(user.id);
+        const runningInstance = runningInstances.find(i => i.workspaceId === workspaceId);
+        if (!runningInstance) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, "Can only set keep-alive for running workspaces");
+        }
+        await this.guardAccess({ kind: "workspaceInstance", subject: runningInstance, workspace: workspace }, "update");
 
-            // if any other running instance has a custom timeout other than the user's default, we'll reset that timeout
-            const client = await this.workspaceManagerClientProvider.get(runningInstance.region);
-            const defaultTimeout = await this.userService.getDefaultWorkspaceTimeout(user);
-            const instancesWithReset = runningInstances.filter(i =>
-                i.workspaceId !== workspaceId &&
-                i.status.timeout !== defaultTimeout &&
-                i.status.phase === "running"
-            );
-            await Promise.all(instancesWithReset.map(i => {
-                const req = new SetTimeoutRequest();
-                req.setId(i.id);
-                req.setDuration(defaultTimeout);
-
-                return client.setTimeout({ span }, req);
-            }));
-
+        // if any other running instance has a custom timeout other than the user's default, we'll reset that timeout
+        const client = await this.workspaceManagerClientProvider.get(runningInstance.region);
+        const defaultTimeout = await this.userService.getDefaultWorkspaceTimeout(user);
+        const instancesWithReset = runningInstances.filter(i =>
+            i.workspaceId !== workspaceId &&
+            i.status.timeout !== defaultTimeout &&
+            i.status.phase === "running"
+        );
+        await Promise.all(instancesWithReset.map(i => {
             const req = new SetTimeoutRequest();
-            req.setId(runningInstance.id);
-            req.setDuration(duration);
-            await client.setTimeout({ span }, req);
+            req.setId(i.id);
+            req.setDuration(defaultTimeout);
 
-            return {
-                resetTimeoutOnWorkspaces: instancesWithReset.map(i => i.workspaceId)
-            }
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
+            return client.setTimeout(ctx, req);
+        }));
+
+        const req = new SetTimeoutRequest();
+        req.setId(runningInstance.id);
+        req.setDuration(duration);
+        await client.setTimeout(ctx, req);
+
+        return {
+            resetTimeoutOnWorkspaces: instancesWithReset.map(i => i.workspaceId)
         }
     }
 
-    public async getWorkspaceTimeout(workspaceId: string): Promise<GetWorkspaceTimeoutResult> {
+    public async getWorkspaceTimeout(ctx: TraceContext, workspaceId: string): Promise<GetWorkspaceTimeoutResult> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
+
         // Allowed in the free version, because it is read only.
         // this.requireEELicense(Feature.FeatureSetTimeout);
 
         const user = this.checkUser("getWorkspaceTimeout");
-        const span = opentracing.globalTracer().startSpan("getWorkspaceTimeout");
-        span.setTag("workspaceId", workspaceId);
-        span.setTag("userId", user.id);
 
-        try {
-            const canChange = await this.maySetTimeout(user);
+        const canChange = await this.maySetTimeout(user);
 
-            const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace({ span }));
-            const runningInstance = await this.workspaceDb.trace({ span }).findRunningInstance(workspaceId);
-            if (!runningInstance) {
-                log.warn({ userId: user.id, workspaceId }, 'Can only get keep-alive for running workspaces');
-                return { duration: "30m", canChange };
-            }
-            await this.guardAccess({ kind: "workspaceInstance", subject: runningInstance, workspaceOwnerID: workspace.ownerId, workspaceIsShared: workspace.shareable || false }, "get");
-
-            const req = new DescribeWorkspaceRequest();
-            req.setId(runningInstance.id);
-
-            const client = await this.workspaceManagerClientProvider.get(runningInstance.region);
-            const desc = await client.describeWorkspace({ span }, req);
-            const duration = desc.getStatus()!.getSpec()!.getTimeout() as WorkspaceTimeoutDuration;
-            return { duration, canChange };
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
+        const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace(ctx));
+        const runningInstance = await this.workspaceDb.trace(ctx).findRunningInstance(workspaceId);
+        if (!runningInstance) {
+            log.warn({ userId: user.id, workspaceId }, 'Can only get keep-alive for running workspaces');
+            return { duration: "30m", canChange };
         }
+        await this.guardAccess({ kind: "workspaceInstance", subject: runningInstance, workspace: workspace }, "get");
+
+        const req = new DescribeWorkspaceRequest();
+        req.setId(runningInstance.id);
+
+        const client = await this.workspaceManagerClientProvider.get(runningInstance.region);
+        const desc = await client.describeWorkspace(ctx, req);
+        const duration = desc.getStatus()!.getSpec()!.getTimeout() as WorkspaceTimeoutDuration;
+        return { duration, canChange };
     }
 
 
-    public async isPrebuildDone(pwsid: string): Promise<boolean> {
+    public async isPrebuildDone(ctx: TraceContext, pwsId: string): Promise<boolean> {
+        traceAPIParams(ctx, { pwsId });
+
         // Allowed in the free version, because it is read only.
         // this.requireEELicense(Feature.FeaturePrebuild);
 
-        const span = opentracing.globalTracer().startSpan("isPrebuildDone");
-        span.setTag("pwsid", pwsid);
-        const ctx: TraceContext = { span };
-        try {
-            const pws = await this.workspaceDb.trace(ctx).findPrebuildByID(pwsid);
-            if (!pws) {
-                // there is no prebuild - that's as good one being done
-                return true;
-            }
-
-            return PrebuiltWorkspace.isDone(pws);
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
+        const pws = await this.workspaceDb.trace(ctx).findPrebuildByID(pwsId);
+        if (!pws) {
+            // there is no prebuild - that's as good one being done
+            return true;
         }
+
+        return PrebuiltWorkspace.isDone(pws);
     }
 
     /**
@@ -282,14 +277,12 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         return this.eligibilityService.maySetTimeout(user);
     }
 
-    public async controlAdmission(id: string, level: "owner" | "everyone"): Promise<void> {
-        this.requireEELicense(Feature.FeatureWorkspaceSharing);
+    public async controlAdmission(ctx: TraceContext, workspaceId: string, level: "owner" | "everyone"): Promise<void> {
+        traceAPIParams(ctx, { workspaceId, level });
+        traceWI(ctx, { workspaceId });
 
-        const user = this.checkAndBlockUser('controlAdmission');
-        const span = opentracing.globalTracer().startSpan("controlAdmission");
-        span.setTag("workspaceId", id);
-        span.setTag("userId", user.id);
-        span.setTag("level", level);
+        this.requireEELicense(Feature.FeatureWorkspaceSharing);
+        this.checkAndBlockUser('controlAdmission');
 
         const lvlmap = new Map<string, AdmissionLevel>();
         lvlmap.set("owner", AdmissionLevel.ADMIT_OWNER_ONLY);
@@ -298,142 +291,155 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
             throw new ResponseError(ErrorCodes.NOT_FOUND, "Invalid admission level.");
         }
 
-        try {
-            const workspace = await this.internalGetWorkspace(id, this.workspaceDb.trace({ span }));
-            await this.guardAccess({ kind: "workspace", subject: workspace }, "update");
+        const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace(ctx));
+        await this.guardAccess({ kind: "workspace", subject: workspace }, "update");
 
-            const instance = await this.workspaceDb.trace({ span }).findRunningInstance(id);
-            if (instance) {
-                await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspaceOwnerID: workspace.ownerId, workspaceIsShared: workspace.shareable || false }, "update");
+        const instance = await this.workspaceDb.trace(ctx).findRunningInstance(workspaceId);
+        if (instance) {
+            await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace: workspace }, "update");
 
-                const req = new ControlAdmissionRequest();
-                req.setId(instance.id);
-                req.setLevel(lvlmap.get(level)!);
-
-                const client = await this.workspaceManagerClientProvider.get(instance.region);
-                await client.controlAdmission({ span }, req);
-            }
-
-            await this.workspaceDb.trace({ span }).transaction(async db => {
-                workspace.shareable = level === 'everyone';
-                await db.store(workspace);
-            });
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
-        }
-    }
-
-    async takeSnapshot(options: GitpodServer.TakeSnapshotOptions): Promise<string> {
-        this.requireEELicense(Feature.FeatureSnapshot);
-
-        const user = this.checkAndBlockUser("takeSnapshot");
-        const { workspaceId, layoutData } = options;
-
-        const span = opentracing.globalTracer().startSpan("takeSnapshot");
-        span.setTag("workspaceId", workspaceId);
-        span.setTag("userId", user.id);
-
-        try {
-            const workspace = await this.workspaceDb.trace({ span }).findById(workspaceId);
-            if (!workspace || workspace.ownerId !== user.id) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, `Workspace ${workspaceId} does not exist.`);
-            }
-
-            const instance = await this.workspaceDb.trace({ span }).findRunningInstance(workspaceId);
-            if (!instance) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, `Workspace ${workspaceId} has no running instance`);
-            }
-
-            await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspaceOwnerID: workspace.ownerId, workspaceIsShared: workspace.shareable || false }, "get");
-            await this.guardAccess({ kind: "snapshot", subject: undefined, workspaceOwnerID: workspace.ownerId, workspaceID: workspace.id }, "create");
+            const req = new ControlAdmissionRequest();
+            req.setId(instance.id);
+            req.setLevel(lvlmap.get(level)!);
 
             const client = await this.workspaceManagerClientProvider.get(instance.region);
-            const request = new TakeSnapshotRequest();
-            request.setId(instance.id);
-            const resp = await client.takeSnapshot({ span }, request);
+            await client.controlAdmission(ctx, req);
+        }
 
-            const id = uuidv4()
-            this.workspaceDb.trace({ span }).storeSnapshot({
-                id,
-                creationTime: new Date().toISOString(),
-                bucketId: resp.getUrl(),
-                originalWorkspaceId: workspaceId,
-                layoutData
-            });
+        await this.workspaceDb.trace(ctx).transaction(async db => {
+            workspace.shareable = level === 'everyone';
+            await db.store(workspace);
+        });
+    }
 
-            return id;
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish()
+    async takeSnapshot(ctx: TraceContext, options: GitpodServer.TakeSnapshotOptions): Promise<string> {
+        traceAPIParams(ctx, { options });
+        const { workspaceId, dontWait } = options;
+        traceWI(ctx, { workspaceId });
+
+        this.requireEELicense(Feature.FeatureSnapshot);
+        const user = this.checkAndBlockUser("takeSnapshot");
+
+        const workspace = await this.guardSnaphotAccess(ctx, user.id, workspaceId);
+
+        const instance = await this.workspaceDb.trace(ctx).findRunningInstance(workspaceId);
+        if (!instance) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, `Workspace ${workspaceId} has no running instance`);
+        }
+        await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace}, "get");
+
+        const client = await this.workspaceManagerClientProvider.get(instance.region);
+        const request = new TakeSnapshotRequest();
+        request.setId(instance.id);
+        request.setReturnImmediately(true);
+
+        // this triggers the snapshots, but returns early! cmp. waitForSnapshot to wait for it's completion
+        const resp = await client.takeSnapshot(ctx, request);
+
+        const snapshot = await this.snapshotService.createSnapshot(options, resp.getUrl());
+
+        // to be backwards compatible during rollout, we require new clients to explicitly pass "dontWait: true"
+        const waitOpts = { workspaceOwner: workspace.ownerId, snapshot };
+        if (!dontWait) {
+            // this mimicks the old behavior: wait until the snapshot is through
+            await this.internalDoWaitForWorkspace(waitOpts);
+        } else {
+            // start driving the snapshot immediately
+            this.internalDoWaitForWorkspace(waitOpts)
+                .catch(err => log.error({ userId: user.id, workspaceId: workspaceId}, "internalDoWaitForWorkspace", err));
+        }
+
+        return snapshot.id;
+    }
+
+    protected async guardSnaphotAccess(ctx: TraceContext, userId: string, workspaceId: string) : Promise<Workspace> {
+        traceAPIParams(ctx, { userId, workspaceId });
+
+        const workspace = await this.workspaceDb.trace(ctx).findById(workspaceId);
+        if (!workspace || workspace.ownerId !== userId) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, `Workspace ${workspaceId} does not exist.`);
+        }
+        await this.guardAccess({ kind: "snapshot", subject: undefined, workspace }, "create");
+
+        return workspace;
+    }
+
+    /**
+     * @param snapshotId
+     * @throws ResponseError with either NOT_FOUND or SNAPSHOT_ERROR in case the snapshot is not done yet.
+     */
+    async waitForSnapshot(ctx: TraceContext, snapshotId: string): Promise<void> {
+        traceAPIParams(ctx, { snapshotId });
+
+        this.requireEELicense(Feature.FeatureSnapshot);
+        const user = this.checkAndBlockUser("waitForSnapshot");
+
+        const snapshot = await this.workspaceDb.trace(ctx).findSnapshotById(snapshotId);
+        if (!snapshot) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, `No snapshot with id '${snapshotId}' found.`)
+        }
+        const snapshotWorkspace = await this.guardSnaphotAccess(ctx, user.id, snapshot.originalWorkspaceId);
+        await this.internalDoWaitForWorkspace({ workspaceOwner: snapshotWorkspace.ownerId, snapshot });
+    }
+
+    protected async internalDoWaitForWorkspace(opts: WaitForSnapshotOptions) {
+        try {
+            await this.snapshotService.waitForSnapshot(opts);
+        } catch (err) {
+            // wrap in SNAPSHOT_ERROR to signal this call should not be retried.
+            throw new ResponseError(ErrorCodes.SNAPSHOT_ERROR, err.toString());
         }
     }
 
-    async getSnapshots(workspaceId: string): Promise<string[]> {
+    async getSnapshots(ctx: TraceContext, workspaceId: string): Promise<string[]> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
+
         // Allowed in the free version, because it is read only.
         // this.requireEELicense(Feature.FeatureSnapshot);
 
         const user = this.checkAndBlockUser("getSnapshots");
 
-        const span = opentracing.globalTracer().startSpan("getSnapshots");
-        span.setTag("workspaceId", workspaceId);
-        span.setTag("userId", user.id);
-
-        try {
-            const workspace = await this.workspaceDb.trace({ span }).findById(workspaceId);
-            if (!workspace || workspace.ownerId !== user.id) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, `Workspace ${workspaceId} does not exist.`);
-            }
-
-            const snapshots = await this.workspaceDb.trace({ span }).findSnapshotsByWorkspaceId(workspaceId);
-            await Promise.all(snapshots.map(s => this.guardAccess({ kind: "snapshot", subject: s, workspaceOwnerID: workspace.ownerId }, "get")));
-
-            return snapshots.map(s => s.id);
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish()
+        const workspace = await this.workspaceDb.trace(ctx).findById(workspaceId);
+        if (!workspace || workspace.ownerId !== user.id) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, `Workspace ${workspaceId} does not exist.`);
         }
+
+        const snapshots = await this.workspaceDb.trace(ctx).findSnapshotsByWorkspaceId(workspaceId);
+        await Promise.all(snapshots.map(s => this.guardAccess({ kind: "snapshot", subject: s, workspace }, "get")));
+
+        return snapshots.map(s => s.id);
     }
 
 
-    async adminGetUsers(req: AdminGetListRequest<User>): Promise<AdminGetListResult<User>> {
+    async adminGetUsers(ctx: TraceContext, req: AdminGetListRequest<User>): Promise<AdminGetListResult<User>> {
+        traceAPIParams(ctx, { req: censor(req, "searchTerm") });    // searchTerm may contain PII
+
         this.requireEELicense(Feature.FeatureAdminDashboard);
 
         await this.guardAdminAccess("adminGetUsers", { req }, Permission.ADMIN_USERS);
 
-        const span = opentracing.globalTracer().startSpan("adminGetUsers");
         try {
             const res = await this.userDB.findAllUsers(req.offset, req.limit, req.orderBy, req.orderDir === "asc" ? "ASC" : "DESC", req.searchTerm);
             res.rows = res.rows.map(this.censorUser);
             return res;
         } catch (e) {
-            TraceContext.logError({ span }, e);
             throw new ResponseError(500, e.toString());
-        } finally {
-            span.finish();
         }
     }
 
-    async adminGetUser(id: string): Promise<User> {
+    async adminGetUser(ctx: TraceContext, userId: string): Promise<User> {
+        traceAPIParams(ctx, { userId });
+
         this.requireEELicense(Feature.FeatureAdminDashboard);
 
-        await this.guardAdminAccess("adminGetUser", { id }, Permission.ADMIN_USERS);
+        await this.guardAdminAccess("adminGetUser", { id: userId }, Permission.ADMIN_USERS);
 
         let result: User | undefined;
-        const span = opentracing.globalTracer().startSpan("adminGetUser");
         try {
-            result = await this.userDB.findUserById(id);
+            result = await this.userDB.findUserById(userId);
         } catch (e) {
-            TraceContext.logError({ span }, e);
             throw new ResponseError(500, e.toString());
-        } finally {
-            span.finish();
         }
 
         if (!result) {
@@ -442,186 +448,160 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         return this.censorUser(result);
     }
 
-    async adminBlockUser(req: AdminBlockUserRequest): Promise<User> {
+    async adminBlockUser(ctx: TraceContext, req: AdminBlockUserRequest): Promise<User> {
+        traceAPIParams(ctx, { req });
+
         this.requireEELicense(Feature.FeatureAdminDashboard);
 
         await this.guardAdminAccess("adminBlockUser", { req }, Permission.ADMIN_USERS);
 
-        const span = opentracing.globalTracer().startSpan("adminBlockUser");
-        try {
-            const target = await this.userDB.findUserById(req.id);
-            if (!target) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, "not found")
-            }
-
-            target.blocked = !!req.blocked;
-            await this.userDB.storeUser(target);
-
-            const workspaceDb = this.workspaceDb.trace({ span });
-            const workspaces = await workspaceDb.findWorkspacesByUser(req.id);
-            const isDefined = <T>(x: T | undefined): x is T => x !== undefined;
-            (await Promise.all(workspaces.map((workspace) => workspaceDb.findRunningInstance(workspace.id))))
-                .filter(isDefined)
-                .forEach(instance => this.internalStopWorkspaceInstance({ span }, instance.id, instance.region, StopWorkspacePolicy.IMMEDIATELY));
-
-            // For some reason, returning the result of `this.userDB.storeUser(target)` does not work. The response never arrives the caller.
-            // Returning `target` instead (which should be equivalent).
-            return this.censorUser(target);
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw new ResponseError(500, e.toString());
-        } finally {
-            span.finish();
+        const target = await this.userDB.findUserById(req.id);
+        if (!target) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, "not found")
         }
+
+        target.blocked = !!req.blocked;
+        await this.userDB.storeUser(target);
+
+        const workspaceDb = this.workspaceDb.trace(ctx);
+        const workspaces = await workspaceDb.findWorkspacesByUser(req.id);
+        const isDefined = <T>(x: T | undefined): x is T => x !== undefined;
+        (await Promise.all(workspaces.map((workspace) => workspaceDb.findRunningInstance(workspace.id))))
+            .filter(isDefined)
+            .forEach(instance => this.internalStopWorkspaceInstance(ctx, instance.id, instance.region, StopWorkspacePolicy.IMMEDIATELY));
+
+        // For some reason, returning the result of `this.userDB.storeUser(target)` does not work. The response never arrives the caller.
+        // Returning `target` instead (which should be equivalent).
+        return this.censorUser(target);
     }
 
-    async adminDeleteUser(id: string): Promise<void> {
+    async adminDeleteUser(ctx: TraceContext, userId: string): Promise<void> {
+        traceAPIParams(ctx, { userId });
+
         this.requireEELicense(Feature.FeatureAdminDashboard);
 
-        await this.guardAdminAccess("adminDeleteUser", { id }, Permission.ADMIN_USERS);
+        await this.guardAdminAccess("adminDeleteUser", { id: userId }, Permission.ADMIN_USERS);
 
-        const span = opentracing.globalTracer().startSpan("adminDeleteUser");
         try {
-            await this.userDeletionService.deleteUser(id);
+            await this.userDeletionService.deleteUser(userId);
         } catch (e) {
-            TraceContext.logError({ span }, e);
             throw new ResponseError(500, e.toString());
-        } finally {
-            span.finish();
         }
     }
 
-    async adminModifyRoleOrPermission(req: AdminModifyRoleOrPermissionRequest): Promise<User> {
+    async adminModifyRoleOrPermission(ctx: TraceContext, req: AdminModifyRoleOrPermissionRequest): Promise<User> {
+        traceAPIParams(ctx, { req });
+
         this.requireEELicense(Feature.FeatureAdminDashboard);
 
         await this.guardAdminAccess("adminModifyRoleOrPermission", { req }, Permission.ADMIN_USERS);
 
-        const span = opentracing.globalTracer().startSpan("adminModifyRoleOrPermission");
-        span.log(req);
-        try {
-            const target = await this.userDB.findUserById(req.id);
-            if (!target) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, "not found")
-            }
-
-            const rolesOrPermissions = new Set((target.rolesOrPermissions || []) as string[]);
-            req.rpp.forEach(e => {
-                if (e.add) {
-                    rolesOrPermissions.add(e.r as string);
-                } else {
-                    rolesOrPermissions.delete(e.r as string)
-                }
-            })
-            target.rolesOrPermissions = Array.from(rolesOrPermissions.values()) as RoleOrPermission[];
-
-            await this.userDB.storeUser(target);
-            // For some reason, neither returning the result of `this.userDB.storeUser(target)` nor returning `target` work.
-            // The response never arrives the caller.
-            // Returning the following works at the cost of an additional DB query:
-            return this.censorUser((await this.userDB.findUserById(req.id))!);
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw new ResponseError(500, e.toString());
-        } finally {
-            span.finish();
+        const target = await this.userDB.findUserById(req.id);
+        if (!target) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, "not found")
         }
+
+        const rolesOrPermissions = new Set((target.rolesOrPermissions || []) as string[]);
+        req.rpp.forEach(e => {
+            if (e.add) {
+                rolesOrPermissions.add(e.r as string);
+            } else {
+                rolesOrPermissions.delete(e.r as string)
+            }
+        })
+        target.rolesOrPermissions = Array.from(rolesOrPermissions.values()) as RoleOrPermission[];
+
+        await this.userDB.storeUser(target);
+        // For some reason, neither returning the result of `this.userDB.storeUser(target)` nor returning `target` work.
+        // The response never arrives the caller.
+        // Returning the following works at the cost of an additional DB query:
+        return this.censorUser((await this.userDB.findUserById(req.id))!);
     }
 
-    async adminModifyPermanentWorkspaceFeatureFlag(req: AdminModifyPermanentWorkspaceFeatureFlagRequest): Promise<User> {
+    async adminModifyPermanentWorkspaceFeatureFlag(ctx: TraceContext, req: AdminModifyPermanentWorkspaceFeatureFlagRequest): Promise<User> {
+        traceAPIParams(ctx, { req });
+
         this.requireEELicense(Feature.FeatureAdminDashboard);
 
         await this.guardAdminAccess("adminModifyPermanentWorkspaceFeatureFlag", { req }, Permission.ADMIN_USERS);
-
-        const span = opentracing.globalTracer().startSpan("adminModifyPermanentWorkspaceFeatureFlag");
-        span.log(req);
-        try {
-            const target = await this.userDB.findUserById(req.id);
-            if (!target) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, "not found")
-            }
-
-            const featureSettings: UserFeatureSettings = target.featureFlags || {};
-            const featureFlags = new Set(featureSettings.permanentWSFeatureFlags || []);
-
-            req.changes.forEach(e => {
-                if (e.add) {
-                    featureFlags.add(e.featureFlag);
-                } else {
-                    featureFlags.delete(e.featureFlag);
-                }
-            });
-            featureSettings.permanentWSFeatureFlags = Array.from(featureFlags);
-            target.featureFlags = featureSettings;
-
-            await this.userDB.storeUser(target);
-            // For some reason, returning the result of `this.userDB.storeUser(target)` does not work. The response never arrives the caller.
-            // Returning `target` instead (which should be equivalent).
-            return this.censorUser(target);
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw new ResponseError(500, e.toString());
-        } finally {
-            span.finish();
+        const target = await this.userDB.findUserById(req.id);
+        if (!target) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, "not found")
         }
+
+        const featureSettings: UserFeatureSettings = target.featureFlags || {};
+        const featureFlags = new Set(featureSettings.permanentWSFeatureFlags || []);
+
+        req.changes.forEach(e => {
+            if (e.add) {
+                featureFlags.add(e.featureFlag);
+            } else {
+                featureFlags.delete(e.featureFlag);
+            }
+        });
+        featureSettings.permanentWSFeatureFlags = Array.from(featureFlags);
+        target.featureFlags = featureSettings;
+
+        await this.userDB.storeUser(target);
+        // For some reason, returning the result of `this.userDB.storeUser(target)` does not work. The response never arrives the caller.
+        // Returning `target` instead (which should be equivalent).
+        return this.censorUser(target);
     }
 
-    async adminGetWorkspaces(req: AdminGetWorkspacesRequest): Promise<AdminGetListResult<WorkspaceAndInstance>> {
+    async adminGetTeamById(ctx: TraceContext, id: string): Promise<Team | undefined> {
+        this.requireEELicense(Feature.FeatureAdminDashboard);
+        await this.guardAdminAccess("adminGetTeamById", { id }, Permission.ADMIN_WORKSPACES);
+        return await this.teamDB.findTeamById(id);
+    }
+
+    async adminGetWorkspaces(ctx: TraceContext, req: AdminGetWorkspacesRequest): Promise<AdminGetListResult<WorkspaceAndInstance>> {
+        traceAPIParams(ctx, { req });
+
         this.requireEELicense(Feature.FeatureAdminDashboard);
 
         await this.guardAdminAccess("adminGetWorkspaces", { req }, Permission.ADMIN_WORKSPACES);
 
-        const span = opentracing.globalTracer().startSpan("adminGetWorkspaces");
-        try {
-            return await this.workspaceDb.trace({ span }).findAllWorkspaceAndInstances(req.offset, req.limit, req.orderBy, req.orderDir === "asc" ? "ASC" : "DESC", req.ownerId, req.searchTerm);
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw new ResponseError(500, e.toString());
-        } finally {
-            span.finish();
-        }
+        return await this.workspaceDb.trace(ctx).findAllWorkspaceAndInstances(req.offset, req.limit, req.orderBy, req.orderDir === "asc" ? "ASC" : "DESC", req, req.searchTerm);
     }
 
-    async adminGetWorkspace(id: string): Promise<WorkspaceAndInstance> {
+    async adminGetWorkspace(ctx: TraceContext, workspaceId: string): Promise<WorkspaceAndInstance> {
+        traceAPIParams(ctx, { workspaceId });
+
         this.requireEELicense(Feature.FeatureAdminDashboard);
 
-        await this.guardAdminAccess("adminGetWorkspace", { id }, Permission.ADMIN_WORKSPACES);
+        await this.guardAdminAccess("adminGetWorkspace", { id: workspaceId }, Permission.ADMIN_WORKSPACES);
 
-        let result: WorkspaceAndInstance | undefined;
-        const span = opentracing.globalTracer().startSpan("adminGetWorkspace");
-        try {
-            result = await this.workspaceDb.trace({ span }).findWorkspaceAndInstance(id);
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw new ResponseError(500, e.toString());
-        } finally {
-            span.finish();
-        }
-
+        const result = await this.workspaceDb.trace(ctx).findWorkspaceAndInstance(workspaceId);
         if (!result) {
             throw new ResponseError(ErrorCodes.NOT_FOUND, "not found")
         }
         return result;
     }
 
-    async adminForceStopWorkspace(id: string): Promise<void> {
+    async adminForceStopWorkspace(ctx: TraceContext, workspaceId: string): Promise<void> {
+        traceAPIParams(ctx, { workspaceId });
+
         this.requireEELicense(Feature.FeatureAdminDashboard);
 
-        await this.guardAdminAccess("adminForceStopWorkspace", { id }, Permission.ADMIN_WORKSPACES);
+        await this.guardAdminAccess("adminForceStopWorkspace", { id: workspaceId }, Permission.ADMIN_WORKSPACES);
 
-        const span = opentracing.globalTracer().startSpan("adminForceStopWorkspace");
-        await this.internalStopWorkspace({ span }, id, undefined, StopWorkspacePolicy.IMMEDIATELY);
+        const workspace = await this.workspaceDb.trace(ctx).findById(workspaceId);
+        if (workspace) {
+            await this.internalStopWorkspace(ctx, workspace, StopWorkspacePolicy.IMMEDIATELY, true);
+        }
     }
 
-    async adminRestoreSoftDeletedWorkspace(id: string): Promise<void> {
+    async adminRestoreSoftDeletedWorkspace(ctx: TraceContext, workspaceId: string): Promise<void> {
+        traceAPIParams(ctx, { workspaceId });
+
         this.requireEELicense(Feature.FeatureAdminDashboard);
 
-        await this.guardAdminAccess("adminRestoreSoftDeletedWorkspace", { id }, Permission.ADMIN_WORKSPACES);
+        await this.guardAdminAccess("adminRestoreSoftDeletedWorkspace", { id: workspaceId }, Permission.ADMIN_WORKSPACES);
 
-        const span = opentracing.globalTracer().startSpan("adminRestoreSoftDeletedWorkspace");
-        await this.workspaceDb.trace({ span }).transaction(async db => {
-            const ws = await db.findById(id);
+        await this.workspaceDb.trace(ctx).transaction(async db => {
+            const ws = await db.findById(workspaceId);
             if (!ws) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, `No workspace with id '${id}' found.`);
+                throw new ResponseError(ErrorCodes.NOT_FOUND, `No workspace with id '${workspaceId}' found.`);
             }
             if (!ws.softDeleted) {
                 return;
@@ -637,155 +617,155 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         });
     }
 
-    protected async guardAdminAccess(method: string, params: any, requiredPermission: PermissionName) {
-        const user = this.checkAndBlockUser(method);
-        if (!this.authorizationService.hasPermission(user, requiredPermission)) {
-            log.warn({ userId: this.user?.id }, "unauthorised admin access", { authorised: false, method, params });
-            throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "not allowed");
-        }
-        log.info({ userId: this.user?.id }, "admin access", { authorised: true, method, params });
+    async adminGetProjectsBySearchTerm(ctx: TraceContext, req: AdminGetListRequest<Project>): Promise<AdminGetListResult<Project>> {
+        this.requireEELicense(Feature.FeatureAdminDashboard);
+        await this.guardAdminAccess("adminGetProjectsBySearchTerm", { req }, Permission.ADMIN_PROJECTS);
+        return await this.projectDB.findProjectsBySearchTerm(req.offset, req.limit, req.orderBy, req.orderDir === "asc" ? "ASC" : "DESC", req.searchTerm as string);
     }
 
-    protected async findPrebuiltWorkspace(ctx: TraceContext, user: User, context: WorkspaceContext, mode: CreateWorkspaceMode): Promise<WorkspaceCreationResult | PrebuiltWorkspaceContext | undefined> {
-        const span = TraceContext.startSpan("findPrebuiltWorkspace", ctx);
-        span.setTag("mode", mode);
-        span.setTag("userId", user.id);
+    async adminGetProjectById(ctx: TraceContext, id: string): Promise<Project | undefined> {
+        this.requireEELicense(Feature.FeatureAdminDashboard);
+        await this.guardAdminAccess("adminGetProjectById", { id }, Permission.ADMIN_PROJECTS);
+        return await this.projectDB.findProjectById(id);
+    }
 
-        try {
-            if (!(CommitContext.is(context) && context.repository.cloneUrl && context.revision)) {
+    protected async findPrebuiltWorkspace(parentCtx: TraceContext, user: User, context: WorkspaceContext, mode: CreateWorkspaceMode): Promise<WorkspaceCreationResult | PrebuiltWorkspaceContext | undefined> {
+        const ctx = TraceContext.childContext("findPrebuiltWorkspace", parentCtx);
+
+        if (!(CommitContext.is(context) && context.repository.cloneUrl && context.revision)) {
+            return;
+        }
+
+        const logCtx: LogContext = { userId: user.id };
+        const cloneUrl = context.repository.cloneUrl;
+        // Note: findPrebuiltWorkspaceByCommit always returns the last triggered prebuild (so, if you re-trigger a prebuild, the newer one will always be used here)
+        const prebuiltWorkspace = await this.workspaceDb.trace(ctx).findPrebuiltWorkspaceByCommit(cloneUrl, context.revision);
+        const logPayload = { mode, cloneUrl, commit: context.revision, prebuiltWorkspace };
+        log.debug(logCtx, "Looking for prebuilt workspace: ", logPayload);
+        if (!prebuiltWorkspace) {
+            return;
+        }
+
+        if (prebuiltWorkspace.state === 'available') {
+            log.info(logCtx, `Found prebuilt workspace for ${cloneUrl}:${context.revision}`, logPayload);
+            const result: PrebuiltWorkspaceContext = {
+                title: context.title,
+                originalContext: context,
+                prebuiltWorkspace
+            };
+            return result;
+        } else if (prebuiltWorkspace.state === 'queued' || prebuiltWorkspace.state === 'building') {
+            if (mode === CreateWorkspaceMode.ForceNew) {
+                // in force mode we ignore running prebuilds as we want to start a workspace as quickly as we can.
                 return;
+                // TODO(janx): Fall back to parent prebuild instead, if it's available:
+                //   const buildWorkspace = await this.workspaceDb.trace({span}).findById(prebuiltWorkspace.buildWorkspaceId);
+                //   const parentPrebuild = await this.workspaceDb.trace({span}).findPrebuildByID(buildWorkspace.basedOnPrebuildId);
+                // Also, make sure to initialize it by both printing the parent prebuild logs AND re-runnnig the before/init/prebuild tasks.
             }
 
-            const logCtx: LogContext = { userId: user.id };
-            const cloneUrl = context.repository.cloneUrl;
-            const prebuiltWorkspace = await this.workspaceDb.trace({ span }).findPrebuiltWorkspaceByCommit(cloneUrl, context.revision);
-            const logPayload = { mode, cloneUrl, commit: context.revision, prebuiltWorkspace };
-            log.debug(logCtx, "Looking for prebuilt workspace: ", logPayload);
-            if (!prebuiltWorkspace) {
-                return;
-            }
-
-            if (prebuiltWorkspace.state === 'available') {
-                log.info(logCtx, `Found prebuilt workspace for ${cloneUrl}:${context.revision}`, logPayload);
-                const result: PrebuiltWorkspaceContext = {
-                    title: context.title,
-                    originalContext: context,
-                    prebuiltWorkspace
-                };
-                return result;
-            } else if (prebuiltWorkspace.state === 'queued' || prebuiltWorkspace.state === 'building') {
-                if (mode === CreateWorkspaceMode.ForceNew) {
-                    // in force mode we ignore running prebuilds as we want to start a workspace as quickly as we can.
-                    return;
-                    // TODO(janx): Fall back to parent prebuild instead, if it's available:
-                    //   const buildWorkspace = await this.workspaceDb.trace({span}).findById(prebuiltWorkspace.buildWorkspaceId);
-                    //   const parentPrebuild = await this.workspaceDb.trace({span}).findPrebuildByID(buildWorkspace.basedOnPrebuildId);
-                    // Also, make sure to initialize it by both printing the parent prebuild logs AND re-runnnig the before/init/prebuild tasks.
-                }
-
-                const workspaceID = prebuiltWorkspace.buildWorkspaceId;
-                const makeResult = (instanceID: string): WorkspaceCreationResult => {
-                    return <WorkspaceCreationResult>{
-                        runningWorkspacePrebuild: {
-                            prebuildID: prebuiltWorkspace.id,
-                            workspaceID,
-                            instanceID,
-                            starting: 'queued',
-                            sameCluster: false,
-                        }
-                    };
-                };
-
-                const wsi = await this.workspaceDb.trace({}).findCurrentInstance(workspaceID);
-                if (!wsi || wsi.stoppedTime !== undefined) {
-                    if (prebuiltWorkspace.state === 'queued') {
-                        if (Date.now() - Date.parse(prebuiltWorkspace.creationTime) > 1000 * 60) {
-                            // queued for long than a minute? Let's retrigger
-                            console.warn('Retriggering queued prebuild.', prebuiltWorkspace);
-                            try {
-                                await this.prebuildManager.retriggerPrebuild({ span }, user, workspaceID);
-                            } catch (err) {
-                                console.error(err);
-                            }
-                        }
-                        return makeResult(wsi!.id);
+            const workspaceID = prebuiltWorkspace.buildWorkspaceId;
+            const makeResult = (instanceID: string): WorkspaceCreationResult => {
+                return <WorkspaceCreationResult>{
+                    runningWorkspacePrebuild: {
+                        prebuildID: prebuiltWorkspace.id,
+                        workspaceID,
+                        instanceID,
+                        starting: 'queued',
+                        sameCluster: false,
                     }
+                };
+            };
 
-                    return;
-                }
-                const result = makeResult(wsi.id);
-
-                const inSameCluster = wsi.region === this.env.installationShortname;
-                if (!inSameCluster) {
-                    if (mode === CreateWorkspaceMode.UsePrebuild) {
-                        /* We need to wait for this prebuild to finish before we return from here.
-                        * This creation mode is meant to be used once we have gone through default mode, have confirmation from the
-                        * message bus that the prebuild is done, and now only have to wait for dbsync to come through. Thus,
-                        * in this mode we'll poll the database until the prebuild is ready (or we time out).
-                        *
-                        * Note: This polling mechanism only makes sense if the prebuild runs in cluster different from ours.
-                        *       Otherwise there's no dbsync inbetween that we might have to wait for.
-                        *
-                        * DB sync interval is 2 seconds at the moment, we wait ten "ticks" for the data to be synchronized.
-                        */
-                        const finishedPrebuiltWorkspace = await this.pollDatabaseUntilPrebuildIsAvailable(prebuiltWorkspace.id, 20000);
-                        if (!finishedPrebuiltWorkspace) {
-                            log.warn(logCtx, "did not find a finished prebuild in the database despite waiting long enough after msgbus confirmed that the prebuild had finished", logPayload);
-                            return;
-                        } else {
-                            return { title: context.title, originalContext: context, prebuiltWorkspace: finishedPrebuiltWorkspace } as PrebuiltWorkspaceContext;
+            const wsi = await this.workspaceDb.trace(ctx).findCurrentInstance(workspaceID);
+            if (!wsi || wsi.stoppedTime !== undefined) {
+                if (prebuiltWorkspace.state === 'queued') {
+                    if (Date.now() - Date.parse(prebuiltWorkspace.creationTime) > 1000 * 60) {
+                        // queued for long than a minute? Let's retrigger
+                        console.warn('Retriggering queued prebuild.', prebuiltWorkspace);
+                        try {
+                            await this.prebuildManager.retriggerPrebuild(ctx, user, workspaceID);
+                        } catch (err) {
+                            console.error(err);
                         }
                     }
+                    return makeResult(wsi!.id);
                 }
 
-                /* This is the default mode behaviour: we present the running prebuild to the user so that they can see the logs
-                * or choose to force the creation of a workspace.
-                */
-                if (wsi.status.phase != 'running') {
-                    result.runningWorkspacePrebuild!.starting = 'starting';
-                } else {
-                    result.runningWorkspacePrebuild!.starting = 'running';
-                }
-                log.info(logCtx, `Found prebuilding (starting=${result.runningWorkspacePrebuild!.starting}) workspace for ${cloneUrl}:${context.revision}`, logPayload);
-                return result;
+                return;
             }
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
+            const result = makeResult(wsi.id);
+
+            const inSameCluster = wsi.region === this.config.installationShortname;
+            if (!inSameCluster) {
+                if (mode === CreateWorkspaceMode.UsePrebuild) {
+                    /* We need to wait for this prebuild to finish before we return from here.
+                    * This creation mode is meant to be used once we have gone through default mode, have confirmation from the
+                    * message bus that the prebuild is done, and now only have to wait for dbsync to come through. Thus,
+                    * in this mode we'll poll the database until the prebuild is ready (or we time out).
+                    *
+                    * Note: This polling mechanism only makes sense if the prebuild runs in cluster different from ours.
+                    *       Otherwise there's no dbsync inbetween that we might have to wait for.
+                    *
+                    * DB sync interval is 2 seconds at the moment, we wait ten "ticks" for the data to be synchronized.
+                    */
+                    const finishedPrebuiltWorkspace = await this.pollDatabaseUntilPrebuildIsAvailable(ctx, prebuiltWorkspace.id, 20000);
+                    if (!finishedPrebuiltWorkspace) {
+                        log.warn(logCtx, "did not find a finished prebuild in the database despite waiting long enough after msgbus confirmed that the prebuild had finished", logPayload);
+                        return;
+                    } else {
+                        return { title: context.title, originalContext: context, prebuiltWorkspace: finishedPrebuiltWorkspace } as PrebuiltWorkspaceContext;
+                    }
+                }
+            }
+
+            /* This is the default mode behaviour: we present the running prebuild to the user so that they can see the logs
+            * or choose to force the creation of a workspace.
+            */
+            if (wsi.status.phase != 'running') {
+                result.runningWorkspacePrebuild!.starting = 'starting';
+            } else {
+                result.runningWorkspacePrebuild!.starting = 'running';
+            }
+            log.info(logCtx, `Found prebuilding (starting=${result.runningWorkspacePrebuild!.starting}) workspace for ${cloneUrl}:${context.revision}`, logPayload);
+            return result;
         }
     }
 
-    async adminSetLicense(key: string): Promise<void> {
+    async adminSetLicense(ctx: TraceContext, key: string): Promise<void> {
+        traceAPIParams(ctx, { });   // don't trace the actual key
+
         await this.guardAdminAccess("adminGetWorkspaces", { key }, Permission.ADMIN_API);
 
         await this.licenseDB.store(uuidv4(), key);
         await this.licenseEvaluator.reloadLicense();
     }
 
-    async getLicenseInfo(): Promise<GetLicenseInfoResult> {
-        const user = this.checkAndBlockUser("getLicenseInfo");
+    // TODO(gpl) This is not part of our API interface, nor can I find any clients. Remove or re-surrect?
+    // async getLicenseInfo(ctx: TraceContext): Promise<GetLicenseInfoResult> {
+    //     const user = this.checkAndBlockUser("getLicenseInfo");
 
-        const { key } = await this.licenseKeySource.getKey();
-        const { validUntil, seats } = this.licenseEvaluator.inspect();
-        const { valid } = this.licenseEvaluator.validate();
+    //     const { key } = await this.licenseKeySource.getKey();
+    //     const { validUntil, seats } = this.licenseEvaluator.inspect();
+    //     const { valid } = this.licenseEvaluator.validate();
 
-        const isAdmin = this.authorizationService.hasPermission(user, Permission.ADMIN_API);
+    //     const isAdmin = this.authorizationService.hasPermission(user, Permission.ADMIN_API);
 
-        return {
-            isAdmin,
-            licenseInfo: {
-                key: isAdmin ? key : "REDACTED",
-                seats,
-                valid,
-                validUntil
-            }
-        };
-    }
+    //     return {
+    //         isAdmin,
+    //         licenseInfo: {
+    //             key: isAdmin ? key : "REDACTED",
+    //             seats,
+    //             valid,
+    //             validUntil
+    //         }
+    //     };
+    // }
 
-    async licenseIncludesFeature(licenseFeature: LicenseFeature): Promise<boolean> {
-        this.checkAndBlockUser("getLicenseInfo");
+    async licenseIncludesFeature(ctx: TraceContext, licenseFeature: LicenseFeature): Promise<boolean> {
+        traceAPIParams(ctx, { licenseFeature });
+
+        this.checkAndBlockUser("licenseIncludesFeature");
 
         let feature: Feature | undefined;
         switch (licenseFeature) {
@@ -801,68 +781,54 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
     }
 
     // (SaaS) – accounting
-    public async getAccountStatement(options: GitpodServer.GetAccountStatementOptions): Promise<AccountStatement> {
+    public async getAccountStatement(ctx: TraceContext, options: GitpodServer.GetAccountStatementOptions): Promise<AccountStatement> {
+        traceAPIParams(ctx, { options });
+
         const user = this.checkUser("getAccountStatement");
         const now = options.date || new Date().toISOString();
         return this.accountStatementProvider.getAccountStatement(user.id, now);
     }
 
-    public async getRemainingUsageHours(): Promise<number> {
-        const span = opentracing.globalTracer().startSpan("getRemainingUsageHours");
-
-        try {
-            const user = this.checkUser("getRemainingUsageHours");
-            const runningInstancesPromise = this.workspaceDb.trace({ span }).findRegularRunningInstances(user.id);
-            return this.accountStatementProvider.getRemainingUsageHours(user.id, new Date().toISOString(), runningInstancesPromise);
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
-        }
+    public async getRemainingUsageHours(ctx: TraceContext): Promise<number> {
+        const user = this.checkUser("getRemainingUsageHours");
+        const runningInstancesPromise = this.workspaceDb.trace(ctx).findRegularRunningInstances(user.id);
+        return this.accountStatementProvider.getRemainingUsageHours(user.id, new Date().toISOString(), runningInstancesPromise);
     }
 
     // (SaaS) – payment/billing
-    async getAvailableCoupons(): Promise<PlanCoupon[]> {
+    async getAvailableCoupons(ctx: TraceContext): Promise<PlanCoupon[]> {
         const user = this.checkUser('getAvailableCoupons');
         const couponIds = await this.couponComputer.getAvailableCouponIds(user);
-        return this.getChargebeePlanCoupons(couponIds);
+        return this.getChargebeePlanCoupons(ctx, couponIds);
     }
 
-    async getAppliedCoupons(): Promise<PlanCoupon[]> {
+    async getAppliedCoupons(ctx: TraceContext): Promise<PlanCoupon[]> {
         const user = this.checkUser('getAppliedCoupons');
         const couponIds = await this.couponComputer.getAppliedCouponIds(user, new Date());
-        return this.getChargebeePlanCoupons(couponIds);
-    }
-
-    public async getPrivateRepoTrialEndDate(): Promise<string | undefined> {
-        const user = this.checkUser("getPrivateTrialInfo");
-
-        const endDate = await this.eligibilityService.getPrivateRepoTrialEndDate(user);
-        if (!endDate) {
-            return undefined;
-        } else {
-            return endDate.toISOString();
-        }
+        return this.getChargebeePlanCoupons(ctx, couponIds);
     }
 
     // chargebee
-    async getChargebeeSiteId(): Promise<string> {
+    async getChargebeeSiteId(ctx: TraceContext): Promise<string> {
         this.checkUser('getChargebeeSiteId');
-        return this.env.chargebeeProviderOptions.site;
+        if (!this.config.chargebeeProviderOptions) {
+            log.error("config error: expected chargebeeProviderOptions but found none!");
+            return "none";
+        }
+        return this.config.chargebeeProviderOptions.site;
     }
 
-    public async isStudent(): Promise<boolean> {
+    public async isStudent(ctx: TraceContext): Promise<boolean> {
         const user = this.checkUser("isStudent");
         return this.eligibilityService.isStudent(user);
     }
 
-    async getShowPaymentUI(): Promise<boolean> {
+    async getShowPaymentUI(ctx: TraceContext): Promise<boolean> {
         this.checkUser('getShowPaymentUI');
-        return this.env.enablePayment;
+        return !!this.config.enablePayment;
     }
 
-    async isChargebeeCustomer(): Promise<boolean> {
+    async isChargebeeCustomer(ctx: TraceContext): Promise<boolean> {
         const user = this.checkUser('isChargebeeCustomer');
 
         return await new Promise<boolean>((resolve, reject) => {
@@ -879,7 +845,9 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         });
     }
 
-    protected async getChargebeePlanCoupons(couponIds: string[]) {
+    protected async getChargebeePlanCoupons(ctx: TraceContext, couponIds: string[]) {
+        traceAPIParams(ctx, { couponIds });
+
         const chargebeeCoupons = await Promise.all(couponIds.map(c => new Promise<chargebee.Coupon | undefined>((resolve, reject) => this.chargebeeProvider.coupon.retrieve(c).request((err, res) => {
             if (!!err) {
                 log.error({}, "could not retrieve coupon: " + err.message, { coupon: c })
@@ -924,7 +892,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         return result;
     }
 
-    async createPortalSession(): Promise<{}> {
+    async createPortalSession(ctx: TraceContext): Promise<{}> {
         const user = this.checkUser('createPortalSession');
         const logContext = { userId: user.id };
 
@@ -945,52 +913,44 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         });
     }
 
-    async checkout(planId: string, planQuantity?: number): Promise<{}> {
+    async checkout(ctx: TraceContext, planId: string, planQuantity?: number): Promise<{}> {
+        traceAPIParams(ctx, { planId, planQuantity });
+
         const user = this.checkUser('checkout');
         const logContext = { userId: user.id };
-
-        const span = opentracing.globalTracer().startSpan("checkout");
-        span.setTag("user", user.id);
 
         // Throws an error if not the case
         await this.ensureIsEligibleForPlan(user, planId);
 
+        const coupon = await this.findAvailableCouponForPlan(user, planId);
+
         try {
-            const coupon = await this.findAvailableCouponForPlan(user, planId);
+            const email = User.getPrimaryEmail(user);
 
-            try {
-                const email = User.getPrimaryEmail(user);
-
-                return new Promise((resolve, reject) => {
-                    this.chargebeeProvider.hosted_page.checkout_new({
-                        customer: {
-                            id: user.id,
-                            email
-                        },
-                        subscription: {
-                            plan_id: planId,
-                            plan_quantity: planQuantity,
-                            coupon
-                        }
-                    }).request((error: any, result: any) => {
-                        if (error) {
-                            log.error(logContext, 'Checkout page error', error);
-                            reject(error);
-                        } else {
-                            log.debug(logContext, 'Checkout page initiated');
-                            resolve(result.hosted_page);
-                        }
-                    });
+            return new Promise((resolve, reject) => {
+                this.chargebeeProvider.hosted_page.checkout_new({
+                    customer: {
+                        id: user.id,
+                        email
+                    },
+                    subscription: {
+                        plan_id: planId,
+                        plan_quantity: planQuantity,
+                        coupon
+                    }
+                }).request((error: any, result: any) => {
+                    if (error) {
+                        log.error(logContext, 'Checkout page error', error);
+                        reject(error);
+                    } else {
+                        log.debug(logContext, 'Checkout page initiated');
+                        resolve(result.hosted_page);
+                    }
                 });
-            } catch (err) {
-                log.error(logContext, 'Checkout error', err);
-                throw err;
-            }
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
+            });
+        } catch (err) {
+            log.error(logContext, 'Checkout error', err);
+            throw err;
         }
     }
 
@@ -1013,13 +973,17 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         return applicableCoupon ? applicableCoupon.id : undefined;
     }
 
-    async subscriptionUpgradeTo(subscriptionId: string, chargebeePlanId: string): Promise<void> {
+    async subscriptionUpgradeTo(ctx: TraceContext, subscriptionId: string, chargebeePlanId: string): Promise<void> {
+        traceAPIParams(ctx, { subscriptionId, chargebeePlanId });
+
         const user = this.checkUser('subscriptionUpgradeTo');
         await this.ensureIsEligibleForPlan(user, chargebeePlanId);
         await this.doUpdateUserPaidSubscription(user.id, subscriptionId, chargebeePlanId, false);
     }
 
-    async subscriptionDowngradeTo(subscriptionId: string, chargebeePlanId: string): Promise<void> {
+    async subscriptionDowngradeTo(ctx: TraceContext, subscriptionId: string, chargebeePlanId: string): Promise<void> {
+        traceAPIParams(ctx, { subscriptionId, chargebeePlanId });
+
         const user = this.checkUser('subscriptionDowngradeTo');
         await this.ensureIsEligibleForPlan(user, chargebeePlanId);
         await this.doUpdateUserPaidSubscription(user.id, subscriptionId, chargebeePlanId, true);
@@ -1040,13 +1004,17 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         }
     }
 
-    async subscriptionCancel(subscriptionId: string): Promise<void> {
+    async subscriptionCancel(ctx: TraceContext, subscriptionId: string): Promise<void> {
+        traceAPIParams(ctx, { subscriptionId });
+
         const user = this.checkUser('subscriptionCancel');
         const chargebeeSubscriptionId = await this.doGetUserPaidSubscription(user.id, subscriptionId);
         await this.chargebeeService.cancelSubscription(chargebeeSubscriptionId, { userId: user.id }, { subscriptionId, chargebeeSubscriptionId });
     }
 
-    async subscriptionCancelDowngrade(subscriptionId: string): Promise<void> {
+    async subscriptionCancelDowngrade(ctx: TraceContext, subscriptionId: string): Promise<void> {
+        traceAPIParams(ctx, { subscriptionId });
+
         const user = this.checkUser('subscriptionCancelDowngrade');
         await this.doCancelDowngradeUserPaidSubscription(user.id, subscriptionId);
     }
@@ -1107,17 +1075,19 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
     }
 
     // Team Subscriptions
-    async tsGet(): Promise<TeamSubscription[]> {
+    async tsGet(ctx: TraceContext): Promise<TeamSubscription[]> {
         const user = this.checkUser('getTeamSubscriptions');
         return this.teamSubscriptionDB.findTeamSubscriptionsForUser(user.id, new Date().toISOString());
     }
 
-    async tsGetSlots(): Promise<TeamSubscriptionSlotResolved[]> {
+    async tsGetSlots(ctx: TraceContext): Promise<TeamSubscriptionSlotResolved[]> {
         const user = this.checkUser('tsGetSlots');
         return this.teamSubscriptionService.findTeamSubscriptionSlotsBy(user.id, new Date());
     }
 
-    async tsGetUnassignedSlot(teamSubscriptionId: string): Promise<TeamSubscriptionSlot | undefined> {
+    async tsGetUnassignedSlot(ctx: TraceContext, teamSubscriptionId: string): Promise<TeamSubscriptionSlot | undefined> {
+        traceAPIParams(ctx, { teamSubscriptionId });
+
         this.checkUser('tsGetUnassignedSlot');
         const slots = await this.teamSubscriptionService.findUnassignedSlots(teamSubscriptionId);
         return slots[0];
@@ -1129,7 +1099,9 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         return slots.filter(TeamSubscriptionSlot.isActive).length;
     }
 
-    async tsAddSlots(teamSubscriptionId: string, addQuantity: number): Promise<void> {
+    async tsAddSlots(ctx: TraceContext, teamSubscriptionId: string, addQuantity: number): Promise<void> {
+        traceAPIParams(ctx, { teamSubscriptionId, addQuantity });
+
         const user = this.checkAndBlockUser('tsAddSlots');
         const ts = await this.internalGetTeamSubscription(teamSubscriptionId, user.id);
 
@@ -1154,7 +1126,9 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         }
     }
 
-    async tsAssignSlot(teamSubscriptionId: string, teamSubscriptionSlotId: string, identityStr: string | undefined): Promise<void> {
+    async tsAssignSlot(ctx: TraceContext, teamSubscriptionId: string, teamSubscriptionSlotId: string, identityStr: string | undefined): Promise<void> {
+        traceAPIParams(ctx, { teamSubscriptionId, teamSubscriptionSlotId });    // identityStr contains PII
+
         const user = this.checkAndBlockUser('tsAssignSlot');
         // assigning a slot can be done by third users
         const ts = await this.internalGetTeamSubscription(teamSubscriptionId, identityStr ? user.id : undefined);
@@ -1164,7 +1138,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
             // Verify assignee:
             //  - must be existing Gitpod user, uniquely identifiable per GitHub/GitLab/Bitbucket name
             //  - in case of Student Subscription: Must be a student
-            const assigneeInfo: FindUserByIdentityStrResult = identityStr ? (await this.findAssignee(logCtx, identityStr)) : (await this.getAssigneeInfo(user));
+            const assigneeInfo: FindUserByIdentityStrResult = identityStr ? (await this.findAssignee(logCtx, identityStr)) : (await this.getAssigneeInfo(ctx, user));
             const { user: assignee, identity: assigneeIdentity, authHost } = assigneeInfo;
             // check here that current user is either the assignee or assigner.
             await this.ensureMayGetAssignedToTS(ts, user, assignee);
@@ -1178,8 +1152,8 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
     }
 
     // Find an (identity, authHost) tuple that uniquely identifies a user (to generate an `identityStr`).
-    protected async getAssigneeInfo(user: User) {
-        const authProviders = await this.getAuthProviders();
+    protected async getAssigneeInfo(ctx: TraceContext, user: User) {
+        const authProviders = await this.getAuthProviders(ctx);
         for (const identity of user.identities) {
             const provider = authProviders.find(p => p.authProviderId === identity.authProviderId);
             if (provider && provider.host) {
@@ -1206,7 +1180,9 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         await this.ensureIsEligibleForPlan(assignee, ts.planId);
     }
 
-    async tsReassignSlot(teamSubscriptionId: string, teamSubscriptionSlotId: string, newIdentityStr: string): Promise<void> {
+    async tsReassignSlot(ctx: TraceContext, teamSubscriptionId: string, teamSubscriptionSlotId: string, newIdentityStr: string): Promise<void> {
+        traceAPIParams(ctx, { teamSubscriptionId, teamSubscriptionSlotId });    // newIdentityStr contains PII
+
         const user = this.checkAndBlockUser('tsReassignSlot');
         const ts = await this.internalGetTeamSubscription(teamSubscriptionId, user.id);
         const logCtx = { userId: user.id };
@@ -1241,7 +1217,9 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
 
     protected updateTeamSubscriptionQueue = new Queue();
 
-    async tsDeactivateSlot(teamSubscriptionId: string, teamSubscriptionSlotId: string): Promise<void> {
+    async tsDeactivateSlot(ctx: TraceContext, teamSubscriptionId: string, teamSubscriptionSlotId: string): Promise<void> {
+        traceAPIParams(ctx, { teamSubscriptionId, teamSubscriptionSlotId });
+
         const user = this.checkAndBlockUser('tsDeactivateSlot');
         const ts = await this.internalGetTeamSubscription(teamSubscriptionId, user.id);
 
@@ -1256,10 +1234,12 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
             } catch (err) {
                 log.error({ userId: user.id }, 'tsDeactivateSlot', err);
             }
-        });
+        }).catch(err => {/** ignore */});
     }
 
-    async tsReactivateSlot(teamSubscriptionId: string, teamSubscriptionSlotId: string): Promise<void> {
+    async tsReactivateSlot(ctx: TraceContext, teamSubscriptionId: string, teamSubscriptionSlotId: string): Promise<void> {
+        traceAPIParams(ctx, { teamSubscriptionId, teamSubscriptionSlotId });
+
         const user = this.checkAndBlockUser('tsReactivateSlot');
         const ts = await this.internalGetTeamSubscription(teamSubscriptionId, user.id);
 
@@ -1274,17 +1254,17 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
             } catch (err) {
                 log.error({ userId: user.id }, 'tsReactivateSlot', err);
             }
-        });
+        }).catch(err => {/** ignore */});
     }
 
-    async getGithubUpgradeUrls(): Promise<GithubUpgradeURL[]> {
+    async getGithubUpgradeUrls(ctx: TraceContext): Promise<GithubUpgradeURL[]> {
         const user = this.checkUser('getGithubUpgradeUrls');
         const ghidentity = user.identities.find(i => i.authProviderId == "Public-GitHub");
         if (!ghidentity) {
             log.debug({ userId: user.id }, "user has no GitHub identity - cannot provide plan upgrade URLs");
             return [];
         }
-        const produceUpgradeURL = (planID: number) => `https://www.github.com/marketplace/${this.env.githubAppMarketplaceName}/upgrade/${planID}/${ghidentity.authId}`;
+        const produceUpgradeURL = (planID: number) => `https://www.github.com/marketplace/${this.config.githubApp?.marketplaceName}/upgrade/${planID}/${ghidentity.authId}`;
 
         // GitHub plans are USD
         return Plans.getAvailablePlans('USD')
@@ -1379,8 +1359,10 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         return subscription;
     }
 
-    // (SaaS) – admin
-    async adminGetAccountStatement(userId: string): Promise<AccountStatement> {
+    // (SaaS) – admin
+    async adminGetAccountStatement(ctx: TraceContext, userId: string): Promise<AccountStatement> {
+        traceAPIParams(ctx, { userId });
+
         const user = this.checkAndBlockUser("adminGetAccountStatement");
         if (!this.authorizationService.hasPermission(user, Permission.ADMIN_USERS)) {
             throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "not allowed");
@@ -1389,7 +1371,9 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         return await this.accountService.getAccountStatement(userId, new Date().toISOString());
     }
 
-    async adminSetProfessionalOpenSource(userId: string, shouldGetProfOSS: boolean): Promise<void> {
+    async adminSetProfessionalOpenSource(ctx: TraceContext, userId: string, shouldGetProfOSS: boolean): Promise<void> {
+        traceAPIParams(ctx, { userId, shouldGetProfOSS });
+
         const user = this.checkAndBlockUser("adminSetProfessionalOpenSource");
         if (!this.authorizationService.hasPermission(user, Permission.ADMIN_USERS)) {
             throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "not allowed");
@@ -1402,7 +1386,9 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         }
     }
 
-    async adminIsStudent(userId: string): Promise<boolean> {
+    async adminIsStudent(ctx: TraceContext, userId: string): Promise<boolean> {
+        traceAPIParams(ctx, { userId });
+
         const user = this.checkAndBlockUser("adminIsStudent");
         if (!this.authorizationService.hasPermission(user, Permission.ADMIN_USERS)) {
             throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "not allowed");
@@ -1411,7 +1397,9 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         return this.eligibilityService.isStudent(userId);
     }
 
-    async adminAddStudentEmailDomain(userId: string, domain: string): Promise<void> {
+    async adminAddStudentEmailDomain(ctx: TraceContext, userId: string, domain: string): Promise<void> {
+        traceAPIParams(ctx, { userId, domain });
+
         const user = this.checkAndBlockUser("adminAddStudentEmailDomain");
         if (!this.authorizationService.hasPermission(user, Permission.ADMIN_USERS)) {
             throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "not allowed");
@@ -1423,7 +1411,9 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         return this.eduDomainDb.storeDomainEntry(domainEntry);
     }
 
-    async adminGrantExtraHours(userId: string, extraHours: number): Promise<void> {
+    async adminGrantExtraHours(ctx: TraceContext, userId: string, extraHours: number): Promise<void> {
+        traceAPIParams(ctx, { userId, extraHours });
+
         const user = this.checkAndBlockUser("adminGrantExtraHours");
         if (!this.authorizationService.hasPermission(user, Permission.ADMIN_USERS)) {
             throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "not allowed");
@@ -1433,10 +1423,12 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
     }
 
     // various
-    async sendFeedback(feedback: string): Promise<string | undefined> {
+    async sendFeedback(ctx: TraceContext, feedback: string): Promise<string | undefined> {
+        traceAPIParams(ctx, { });   // feedback is not interesting here, any may contain names
+
         const user = this.checkUser("sendFeedback");
         const now = new Date().toISOString();
-        const remainingUsageHours = await this.getRemainingUsageHours();
+        const remainingUsageHours = await this.getRemainingUsageHours(ctx);
         const stillEnoughCredits = remainingUsageHours > Math.max(...Accounting.LOW_CREDIT_WARNINGS_IN_HOURS);
         log.info({ userId: user.id }, `Feedback: "${feedback}"`, { feedback, stillEnoughCredits });
         if (stillEnoughCredits) {
@@ -1447,45 +1439,142 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
     }
 
     // Projects
-    async getProviderRepositoriesForUser(params: { provider: string, hints?: object }): Promise<ProviderRepository[]> {
+    async getProviderRepositoriesForUser(ctx: TraceContext, params: { provider: string, hints?: object }): Promise<ProviderRepository[]> {
+        traceAPIParams(ctx, { params });
+
         const user = this.checkAndBlockUser("getProviderRepositoriesForUser");
 
-        const repositories = await this.githubAppSupport.getProviderRepositoriesForUser({ user, ...params });
+        const repositories: ProviderRepository[] = [];
+        const providerHost = params.provider;
+        const provider = (await this.getAuthProviders(ctx)).find(ap => ap.host === providerHost);
+
+        if (providerHost === "github.com") {
+            repositories.push(...(await this.githubAppSupport.getProviderRepositoriesForUser({ user, ...params })));
+        } else if (providerHost === "bitbucket.org" && provider) {
+            repositories.push(...(await this.bitbucketAppSupport.getProviderRepositoriesForUser({ user, provider })));
+        } else if (provider?.authProviderType === "GitLab") {
+            repositories.push(...(await this.gitLabAppSupport.getProviderRepositoriesForUser({ user, provider })));
+        } else {
+            log.info({ userId: user.id }, `Unsupported provider: "${params.provider}"`, { params });
+        }
         const projects = await this.projectsService.getProjectsByCloneUrls(repositories.map(r => r.cloneUrl));
 
-        const cloneUrlsInUse = new Set(projects.map(p => p.cloneUrl));
-        repositories.forEach(r => { r.inUse = cloneUrlsInUse.has(r.cloneUrl) });
+        const cloneUrlToProject = new Map(projects.map(p => [p.cloneUrl, p]));
+
+        for (const repo of repositories) {
+            const p = cloneUrlToProject.get(repo.cloneUrl);
+            const repoProvider = new URL(repo.cloneUrl).host.split(".")[0];
+
+            if (p) {
+                if (p.userId) {
+                    const owner = await this.userDB.findUserById(p.userId);
+                    if (owner) {
+                        const ownerProviderMatchingRepoProvider = owner.identities.find((identity, index) => identity.authProviderId.toLowerCase().includes(repoProvider));
+                        if (ownerProviderMatchingRepoProvider) {
+                            repo.inUse = {
+                                userName: ownerProviderMatchingRepoProvider?.authName
+                            }
+                        }
+                    }
+                } else if (p.teamOwners && p.teamOwners[0]) {
+                    repo.inUse = {
+                        userName: p.teamOwners[0] || 'somebody'
+                    }
+                }
+            }
+        }
 
         return repositories;
     }
 
-    async triggerPrebuild(projectId: string, branchName: string): Promise<void> {
+    async triggerPrebuild(ctx: TraceContext, projectId: string, branchName: string | null): Promise<StartPrebuildResult> {
+        traceAPIParams(ctx, { projectId, branchName });
+
         const user = this.checkAndBlockUser("triggerPrebuild");
 
         const project = await this.projectsService.getProject(projectId);
         if (!project) {
-            return;
+            throw new ResponseError(ErrorCodes.NOT_FOUND, "Project not found");
         }
         await this.guardProjectOperation(user, projectId, "update");
 
-        const span = opentracing.globalTracer().startSpan("triggerPrebuild");
-        span.setTag("userId", user.id);
-
-        const branchDetails = await this.projectsService.getBranchDetails(user, project, branchName);
+        const branchDetails = (!!branchName
+            ? await this.projectsService.getBranchDetails(user, project, branchName)
+            : (await this.projectsService.getBranchDetails(user, project)).filter(b => b.isDefault));
         if (branchDetails.length !== 1) {
             log.debug({ userId: user.id }, 'Cannot find branch details.', { project, branchName });
+            throw new ResponseError(ErrorCodes.NOT_FOUND, `Could not find ${!branchName ? 'a default branch' : `branch '${branchName}'`} in repository ${project.cloneUrl}`);
         }
         const contextURL = branchDetails[0].url;
 
-        const context = await this.contextParser.handle({ span }, user, contextURL) as CommitContext;
+        const context = await this.contextParser.handle(ctx, user, contextURL) as CommitContext;
 
-        await this.prebuildManager.startPrebuild({ span }, {
+        const prebuild = await this.prebuildManager.startPrebuild(ctx, {
             contextURL,
             cloneURL: project.cloneUrl,
             commit: context.revision,
             user,
-            branch: branchName,
+            branch: branchDetails[0].name,
             project
         });
+
+        this.analytics.track({
+            userId: user.id,
+            event: "prebuild_triggered",
+            properties: {
+                context_url: contextURL,
+                clone_url: project.cloneUrl,
+                commit: context.revision,
+                branch: branchDetails[0].name,
+                project_id: project.id
+            }
+        });
+
+        return prebuild;
     }
+
+    async adminFindPrebuilds(ctx: TraceContext, params: FindPrebuildsParams): Promise<PrebuildWithStatus[]> {
+        traceAPIParams(ctx, { params });
+        this.requireEELicense(Feature.FeatureAdminDashboard);
+        await this.guardAdminAccess("adminFindPrebuilds", { params }, Permission.ADMIN_PROJECTS);
+
+        return this.projectsService.findPrebuilds(params);
+    }
+
+    async cancelPrebuild(ctx: TraceContext, projectId: string, prebuildId: string): Promise<void> {
+        traceAPIParams(ctx, { projectId, prebuildId });
+
+        const user = this.checkAndBlockUser("cancelPrebuild");
+
+        const project = await this.projectsService.getProject(projectId);
+        if (!project) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, "Project not found");
+        }
+        await this.guardProjectOperation(user, projectId, "update");
+
+        const prebuild = await this.workspaceDb.trace(ctx).findPrebuildByID(prebuildId);
+        if (!prebuild) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, "Prebuild not found");
+        }
+        // Explicitly stopping the prebuild workspace now automaticaly cancels the prebuild
+        await this.stopWorkspace(ctx, prebuild.buildWorkspaceId);
+    }
+
+    public async createProject(ctx: TraceContext, params: CreateProjectParams): Promise<Project> {
+        // parameters are already traced in super call
+        const project = await super.createProject(ctx, params);
+
+        // update client registration for the logged in user
+        this.disposables.push(this.localMessageBroker.listenForPrebuildUpdates(
+            project.id,
+            (ctx: TraceContext, update: PrebuildWithStatus) =>  TraceContext.withSpan("forwardPrebuildUpdateToClient", (ctx) => {
+                traceClientMetadata(ctx, this.clientMetadata);
+                TraceContext.setJsonRPCMetadata(ctx, "onPrebuildUpdate");
+
+                this.client?.onPrebuildUpdate(update);
+            }, ctx)
+        ));
+        return project;
+    }
+
 }

@@ -23,16 +23,17 @@ import (
 	"sync"
 	"time"
 
-	gitpod "github.com/gitpod-io/gitpod/gitpod-protocol"
-	app "github.com/gitpod-io/gitpod/local-app/api"
-	supervisor "github.com/gitpod-io/gitpod/supervisor/api"
 	"github.com/google/uuid"
 	"github.com/kevinburke/ssh_config"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/sirupsen/logrus"
+	gitpod "github.com/gitpod-io/gitpod/gitpod-protocol"
+	app "github.com/gitpod-io/gitpod/local-app/api"
+	supervisor "github.com/gitpod-io/gitpod/supervisor/api"
 )
 
 var (
@@ -77,8 +78,10 @@ type Workspace struct {
 	supervisorListener *TunnelListener
 	supervisorClient   *grpc.ClientConn
 
-	tunnelListenersMu sync.RWMutex
-	tunnelListeners   map[uint32]*TunnelListener
+	tunnelMu        sync.RWMutex
+	tunnelListeners map[uint32]*TunnelListener
+	tunnelEnabled   bool
+	cancelTunnel    context.CancelFunc
 
 	localSSHListener *TunnelListener
 	SSHPrivateFN     string
@@ -89,12 +92,11 @@ type Workspace struct {
 
 	tunnelClient          chan chan *TunnelClient
 	tunnelClientConnected bool
-	portsTunneled         bool
 }
 
 func (ws *Workspace) Status() []*app.TunnelStatus {
-	ws.tunnelListenersMu.RLock()
-	defer ws.tunnelListenersMu.RUnlock()
+	ws.tunnelMu.RLock()
+	defer ws.tunnelMu.RUnlock()
 	res := make([]*app.TunnelStatus, 0, len(ws.tunnelListeners))
 	for _, listener := range ws.tunnelListeners {
 		res = append(res, &app.TunnelStatus{
@@ -150,6 +152,7 @@ func (s *SSHConfigWritingCallback) InstanceUpdate(w *Workspace) {
 				&ssh_config.KV{Key: "User", Value: "gitpod"},
 				&ssh_config.KV{Key: "Port", Value: port},
 				&ssh_config.KV{Key: "IdentityFile", Value: ws.SSHPrivateFN},
+				&ssh_config.KV{Key: "IdentitiesOnly", Value: "yes"},
 			},
 		})
 	}
@@ -161,22 +164,29 @@ func (s *SSHConfigWritingCallback) InstanceUpdate(w *Workspace) {
 	}
 }
 
-func New(client gitpod.APIInterface, cb Callbacks) *Bastion {
+func New(client gitpod.APIInterface, localAppTimeout time.Duration, cb Callbacks) *Bastion {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Bastion{
-		Client:        client,
-		Callbacks:     cb,
-		workspaces:    make(map[string]*Workspace),
-		ctx:           ctx,
-		stop:          cancel,
-		updates:       make(chan *gitpod.WorkspaceInstance, 10),
-		subscriptions: make(map[*StatusSubscription]struct{}, 10),
+		Client:                 client,
+		Callbacks:              cb,
+		workspaces:             make(map[string]*Workspace),
+		localAppTimeout:        localAppTimeout,
+		workspaceMapChangeChan: make(chan int),
+		ctx:                    ctx,
+		stop:                   cancel,
+		updates:                make(chan *WorkspaceUpdateRequest, 10),
+		subscriptions:          make(map[*StatusSubscription]struct{}, 10),
 	}
+}
+
+type WorkspaceUpdateRequest struct {
+	instance *gitpod.WorkspaceInstance
+	done     chan *Workspace
 }
 
 type Bastion struct {
 	id      string
-	updates chan *gitpod.WorkspaceInstance
+	updates chan *WorkspaceUpdateRequest
 
 	Client    gitpod.APIInterface
 	Callbacks Callbacks
@@ -184,11 +194,16 @@ type Bastion struct {
 	workspacesMu sync.RWMutex
 	workspaces   map[string]*Workspace
 
+	localAppTimeout        time.Duration
+	workspaceMapChangeChan chan int
+
 	ctx  context.Context
 	stop context.CancelFunc
 
 	subscriptionsMu sync.RWMutex
 	subscriptions   map[*StatusSubscription]struct{}
+
+	EnableAutoTunnel bool
 }
 
 func (b *Bastion) Run() error {
@@ -212,6 +227,11 @@ func (b *Bastion) Run() error {
 		}
 	}()
 
+	go b.handleTimeout()
+	if b.localAppTimeout != 0 {
+		b.workspaceMapChangeChan <- 0
+	}
+
 	go func() {
 		for u := range b.updates {
 			b.handleUpdate(u)
@@ -220,7 +240,9 @@ func (b *Bastion) Run() error {
 	b.FullUpdate()
 
 	for u := range updates {
-		b.updates <- u
+		b.updates <- &WorkspaceUpdateRequest{
+			instance: u,
+		}
 	}
 	return nil
 }
@@ -234,12 +256,59 @@ func (b *Bastion) FullUpdate() {
 			if ws.LatestInstance == nil {
 				continue
 			}
-			b.updates <- ws.LatestInstance
+			b.updates <- &WorkspaceUpdateRequest{
+				instance: ws.LatestInstance,
+			}
 		}
 	}
 }
 
-func (b *Bastion) handleUpdate(u *gitpod.WorkspaceInstance) {
+func (b *Bastion) Update(workspaceID string) *Workspace {
+	ws, err := b.Client.GetWorkspace(b.ctx, workspaceID)
+	if err != nil {
+		logrus.WithError(err).WithField("WorkspaceID", workspaceID).Error("cannot get workspace")
+		return nil
+	}
+	if ws.LatestInstance == nil {
+		return nil
+	}
+	done := make(chan *Workspace)
+	b.updates <- &WorkspaceUpdateRequest{
+		instance: ws.LatestInstance,
+		done:     done,
+	}
+	return <-done
+}
+
+func (b *Bastion) handleTimeout() {
+	if b.localAppTimeout == 0 {
+		return
+	}
+	var timer *time.Timer
+	for count := range b.workspaceMapChangeChan {
+		if count == 0 && timer == nil {
+			logrus.Debugf("local app will terminate in %v", b.localAppTimeout)
+			timer = time.AfterFunc(b.localAppTimeout, func() {
+				os.Exit(0)
+			})
+		} else if count != 0 && timer != nil {
+			logrus.Debugln("reset local app terminate timeout")
+			timer.Stop()
+			timer = nil
+		}
+	}
+}
+
+func (b *Bastion) handleUpdate(ur *WorkspaceUpdateRequest) {
+	var ws *Workspace
+	u := ur.instance
+	defer func() {
+		if ur.done != nil {
+			ur.done <- ws
+			close(ur.done)
+		}
+	}()
+
 	b.workspacesMu.Lock()
 	defer b.workspacesMu.Unlock()
 
@@ -258,6 +327,7 @@ func (b *Bastion) handleUpdate(u *gitpod.WorkspaceInstance) {
 
 			tunnelClient:    make(chan chan *TunnelClient, 1),
 			tunnelListeners: make(map[uint32]*TunnelListener),
+			tunnelEnabled:   true,
 		}
 	}
 	ws.Phase = u.Status.Phase
@@ -288,7 +358,7 @@ func (b *Bastion) handleUpdate(u *gitpod.WorkspaceInstance) {
 			var err error
 			ws.supervisorClient, err = grpc.Dial(ws.supervisorListener.LocalAddr, grpc.WithInsecure())
 			if err != nil {
-				logrus.WithError(err).WithField("workspace", ws.WorkspaceID).Print("error connecting to supervisor")
+				logrus.WithError(err).WithField("workspace", ws.WorkspaceID).Error("error connecting to supervisor")
 			} else {
 				go func() {
 					<-ws.ctx.Done()
@@ -297,8 +367,7 @@ func (b *Bastion) handleUpdate(u *gitpod.WorkspaceInstance) {
 			}
 		}
 
-		if ws.supervisorClient != nil && !ws.portsTunneled {
-			ws.portsTunneled = true
+		if ws.supervisorClient != nil && b.EnableAutoTunnel {
 			go b.tunnelPorts(ws)
 		}
 
@@ -322,11 +391,17 @@ func (b *Bastion) handleUpdate(u *gitpod.WorkspaceInstance) {
 		ws.cancel()
 		delete(b.workspaces, u.ID)
 		b.Callbacks.InstanceUpdate(ws)
+		if b.localAppTimeout != 0 {
+			b.workspaceMapChangeChan <- len(b.workspaces)
+		}
 		return
 	}
 
 	b.workspaces[u.ID] = ws
 	b.Callbacks.InstanceUpdate(ws)
+	if b.localAppTimeout != 0 {
+		b.workspaceMapChangeChan <- len(b.workspaces)
+	}
 }
 
 func generateSSHKeys(instanceID string) (privateKeyFN string, publicKey string, err error) {
@@ -388,13 +463,13 @@ func generateSSHKeys(instanceID string) (privateKeyFN string, publicKey string, 
 
 func (b *Bastion) connectTunnelClient(ctx context.Context, ws *Workspace) error {
 	if ws.URL == "" {
-		return fmt.Errorf("IDE URL is empty")
+		return xerrors.Errorf("IDE URL is empty")
 	}
 	if ws.OwnerToken == "" {
-		return fmt.Errorf("owner token is empty")
+		return xerrors.Errorf("owner token is empty")
 	}
 	if ws.tunnelClientConnected {
-		return fmt.Errorf("tunnel: ssh client is already connected")
+		return xerrors.Errorf("tunnel: ssh client is already connected")
 	}
 	ws.tunnelClientConnected = true
 
@@ -405,7 +480,7 @@ func (b *Bastion) connectTunnelClient(ctx context.Context, ws *Workspace) error 
 	h := make(http.Header)
 	h.Set("x-gitpod-owner-token", ws.OwnerToken)
 	webSocket := gitpod.NewReconnectingWebsocket(tunnelURL, h, logrus.WithField("workspace", ws.WorkspaceID))
-	go webSocket.Dial()
+	go webSocket.Dial(ctx)
 	go func() {
 		var (
 			client *TunnelClient
@@ -483,10 +558,10 @@ func newTunnelClient(ctx context.Context, ws *Workspace, reconnecting *gitpod.Re
 
 func (b *Bastion) establishTunnel(ctx context.Context, ws *Workspace, logprefix string, remotePort int, targetPort int, visibility supervisor.TunnelVisiblity) (*TunnelListener, error) {
 	if !ws.tunnelClientConnected {
-		return nil, fmt.Errorf("tunnel client is not connected")
+		return nil, xerrors.Errorf("tunnel client is not connected")
 	}
 	if visibility == supervisor.TunnelVisiblity_none {
-		return nil, fmt.Errorf("tunnel visibility is none")
+		return nil, xerrors.Errorf("tunnel visibility is none")
 	}
 
 	targetHost := "127.0.0.1"
@@ -577,12 +652,12 @@ func (b *Bastion) establishTunnel(ctx context.Context, ws *Workspace, logprefix 
 
 func (b *Bastion) establishSSHTunnel(ws *Workspace) (listener *TunnelListener, err error) {
 	if ws.SSHPublicKey == "" {
-		return nil, fmt.Errorf("no public key generated")
+		return nil, xerrors.Errorf("no public key generated")
 	}
 
 	err = installSSHAuthorizedKey(ws, ws.SSHPublicKey)
 	if err != nil {
-		return nil, fmt.Errorf("cannot install authorized key: %w", err)
+		return nil, xerrors.Errorf("cannot install authorized key: %w", err)
 	}
 	listener, err = b.establishTunnel(ws.ctx, ws, "ssh", 23001, 0, supervisor.TunnelVisiblity_host)
 	return listener, err
@@ -640,7 +715,7 @@ func installSSHAuthorizedKey(ws *Workspace, key string) error {
 		return ctx.Err()
 	case success := <-done:
 		if !success {
-			return fmt.Errorf("unable to upload SSH key")
+			return xerrors.Errorf("unable to upload SSH key")
 		}
 	}
 
@@ -648,13 +723,27 @@ func installSSHAuthorizedKey(ws *Workspace, key string) error {
 }
 
 func (b *Bastion) tunnelPorts(ws *Workspace) {
+	ws.tunnelMu.Lock()
+	if !ws.tunnelEnabled || ws.cancelTunnel != nil {
+		ws.tunnelMu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(ws.ctx)
+	ws.cancelTunnel = cancel
+	ws.tunnelMu.Unlock()
+
 	defer func() {
-		ws.portsTunneled = false
+		ws.tunnelMu.Lock()
+		defer ws.tunnelMu.Unlock()
+
+		ws.cancelTunnel = nil
 		logrus.WithField("workspace", ws.WorkspaceID).Info("ports tunneling finished")
 	}()
+
 	for {
 		logrus.WithField("workspace", ws.WorkspaceID).Info("tunneling ports...")
-		err := b.doTunnelPorts(ws)
+
+		err := b.doTunnelPorts(ctx, ws)
 		if ws.ctx.Err() != nil {
 			return
 		}
@@ -662,15 +751,16 @@ func (b *Bastion) tunnelPorts(ws *Workspace) {
 			logrus.WithError(err).WithField("workspace", ws.WorkspaceID).Warn("ports tunneling failed, retrying...")
 		}
 		select {
-		case <-ws.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-time.After(1 * time.Second):
 		}
 	}
 }
-func (b *Bastion) doTunnelPorts(ws *Workspace) error {
+
+func (b *Bastion) doTunnelPorts(ctx context.Context, ws *Workspace) error {
 	statusService := supervisor.NewStatusServiceClient(ws.supervisorClient)
-	status, err := statusService.PortsStatus(ws.ctx, &supervisor.PortsStatusRequest{
+	status, err := statusService.PortsStatus(ctx, &supervisor.PortsStatusRequest{
 		Observe: true,
 	})
 	if err != nil {
@@ -678,8 +768,8 @@ func (b *Bastion) doTunnelPorts(ws *Workspace) error {
 	}
 	defer b.notify(ws)
 	defer func() {
-		ws.tunnelListenersMu.Lock()
-		defer ws.tunnelListenersMu.Unlock()
+		ws.tunnelMu.Lock()
+		defer ws.tunnelMu.Unlock()
 		for port, t := range ws.tunnelListeners {
 			delete(ws.tunnelListeners, port)
 			t.Cancel()
@@ -690,7 +780,7 @@ func (b *Bastion) doTunnelPorts(ws *Workspace) error {
 		if err != nil {
 			return err
 		}
-		ws.tunnelListenersMu.Lock()
+		ws.tunnelMu.Lock()
 		currentTunneled := make(map[uint32]struct{})
 		for _, port := range resp.Ports {
 			visibility := supervisor.TunnelVisiblity_none
@@ -730,7 +820,7 @@ func (b *Bastion) doTunnelPorts(ws *Workspace) error {
 				listener.Cancel()
 			}
 		}
-		ws.tunnelListenersMu.Unlock()
+		ws.tunnelMu.Unlock()
 		b.notify(ws)
 	}
 }
@@ -805,4 +895,24 @@ func (b *Bastion) Subscribe(instanceID string) (*StatusSubscription, error) {
 	// makes sure that no updates can happen between clients receiving an initial status and subscribing
 	sub.updates <- b.Status(instanceID)
 	return sub, nil
+}
+
+func (b *Bastion) AutoTunnel(instanceID string, enabled bool) {
+	ws, ok := b.getWorkspace(instanceID)
+	if !ok {
+		return
+	}
+	ws.tunnelMu.Lock()
+	defer ws.tunnelMu.Unlock()
+	if ws.tunnelEnabled == enabled {
+		return
+	}
+	ws.tunnelEnabled = enabled
+	if enabled {
+		if ws.cancelTunnel == nil && b.EnableAutoTunnel {
+			b.Update(ws.WorkspaceID)
+		}
+	} else if ws.cancelTunnel != nil {
+		ws.cancelTunnel()
+	}
 }

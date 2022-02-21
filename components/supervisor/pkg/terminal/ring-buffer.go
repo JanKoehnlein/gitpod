@@ -4,9 +4,7 @@
 
 package terminal
 
-import (
-	"fmt"
-)
+import "golang.org/x/xerrors"
 
 // RingBuffer implements a ring buffer. It is a fixed size,
 // and new writes overwrite older data, such that for a buffer
@@ -23,7 +21,7 @@ type RingBuffer struct {
 // must be greater than 0.
 func NewRingBuffer(size int64) (*RingBuffer, error) {
 	if size <= 0 {
-		return nil, fmt.Errorf("Size must be positive")
+		return nil, xerrors.Errorf("Size must be positive")
 	}
 
 	b := &RingBuffer{
@@ -58,12 +56,12 @@ func (b *RingBuffer) Write(buf []byte) (int, error) {
 	return n, nil
 }
 
-// Size returns the size of the buffer
+// Size returns the size of the buffer.
 func (b *RingBuffer) Size() int64 {
 	return b.size
 }
 
-// TotalWritten provides the total number of bytes written
+// TotalWritten provides the total number of bytes written.
 func (b *RingBuffer) TotalWritten() int64 {
 	return b.written
 }
@@ -90,7 +88,7 @@ func (b *RingBuffer) Reset() {
 	b.written = 0
 }
 
-// String returns the contents of the buffer as a string
+// String returns the contents of the buffer as a string.
 func (b *RingBuffer) String() string {
 	return string(b.Bytes())
 }

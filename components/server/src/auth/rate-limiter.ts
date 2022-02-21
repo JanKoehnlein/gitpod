@@ -10,8 +10,9 @@ import { RateLimiterMemory, RateLimiterRes } from "rate-limiter-flexible";
 
 
 export const accessCodeSyncStorage = 'accessCodeSyncStorage';
-export const accesHeadlessLogs = 'accesHeadlessLogs';
-type GitpodServerMethodType = keyof Omit<GitpodServer, "dispose" | "setClient"> | typeof accessCodeSyncStorage | typeof accesHeadlessLogs;
+export const accessHeadlessLogs = 'accessHeadlessLogs';
+type GitpodServerMethodType = keyof Omit<GitpodServer, "dispose" | "setClient"> | typeof accessCodeSyncStorage | typeof accessHeadlessLogs;
+type GroupKey = "default" | "startWorkspace";
 type GroupsConfig = {
     [key: string]: {
         points: number,
@@ -20,7 +21,7 @@ type GroupsConfig = {
 }
 type FunctionsConfig = {
     [K in GitpodServerMethodType]: {
-        group: string,
+        group: GroupKey,
         points: number,
     }
 }
@@ -35,6 +36,10 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
             points: 60000, // 1,000 calls per user per second
             durationsSec: 60,
         },
+        startWorkspace: {
+            points: 1,  // 1 workspace start per user per 10s
+            durationsSec: 10
+        },
     }
     const defaultFunctions: FunctionsConfig = {
         "getLoggedInUser": { group: "default", points: 1 },
@@ -44,8 +49,8 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
         "getOwnAuthProviders": { group: "default", points: 1 },
         "updateOwnAuthProvider": { group: "default", points: 1 },
         "deleteOwnAuthProvider": { group: "default", points: 1 },
-        "getBranding": { group: "default", points: 1 },
         "getConfiguration": { group: "default", points: 1 },
+        "getGitpodTokenScopes": { group: "default", points: 1 },
         "getToken": { group: "default", points: 1 },
         "getPortAuthenticationToken": { group: "default", points: 1 },
         "deleteAccount": { group: "default", points: 1 },
@@ -55,10 +60,12 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
         "getWorkspaceOwner": { group: "default", points: 1 },
         "getWorkspaceUsers": { group: "default", points: 1 },
         "getFeaturedRepositories": { group: "default", points: 1 },
+        "getSuggestedContextURLs": { group: "default", points: 1 },
         "getWorkspace": { group: "default", points: 1 },
         "isWorkspaceOwner": { group: "default", points: 1 },
+        "getOwnerToken": { group: "default", points: 1 },
         "createWorkspace": { group: "default", points: 1 },
-        "startWorkspace": { group: "default", points: 1 },
+        "startWorkspace": { group: "startWorkspace", points: 1 },
         "stopWorkspace": { group: "default", points: 1 },
         "deleteWorkspace": { group: "default", points: 1 },
         "setWorkspaceDescription": { group: "default", points: 1 },
@@ -79,6 +86,9 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
         "getAllEnvVars": { group: "default", points: 1 },
         "setEnvVar": { group: "default", points: 1 },
         "deleteEnvVar": { group: "default", points: 1 },
+        "setProjectEnvironmentVariable": { group: "default", points: 1 },
+        "getProjectEnvironmentVariables": { group: "default", points: 1 },
+        "deleteProjectEnvironmentVariable": { group: "default", points: 1 },
         "getTeams": { group: "default", points: 1 },
         "getTeamMembers": { group: "default", points: 1 },
         "createTeam": { group: "default", points: 1 },
@@ -87,6 +97,7 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
         "removeTeamMember": { group: "default", points: 1 },
         "getGenericInvite": { group: "default", points: 1 },
         "resetGenericInvite": { group: "default", points: 1 },
+        "deleteTeam": { group: "default", points: 1 },
         "getProviderRepositoriesForUser":  { group: "default", points: 1 },
         "createProject":  { group: "default", points: 1 },
         "getTeamProjects": { group: "default", points: 1 },
@@ -95,8 +106,13 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
         "findPrebuilds":  { group: "default", points: 1 },
         "getProjectOverview":  { group: "default", points: 1 },
         "triggerPrebuild":  { group: "default", points: 1 },
-        "setProjectConfiguration":  { group: "default", points: 1 },
+        "cancelPrebuild":  { group: "default", points: 1 },
         "fetchProjectRepositoryConfiguration":  { group: "default", points: 1 },
+        "guessProjectConfiguration":  { group: "default", points: 1 },
+        "fetchRepositoryConfiguration": { group: "default", points: 1 },
+        "guessRepositoryConfiguration": { group: "default", points: 1 },
+        "setProjectConfiguration":  { group: "default", points: 1 },
+        "updateProjectPartial":  { group: "default", points: 1 },
         "getContentBlobUploadUrl": { group: "default", points: 1 },
         "getContentBlobDownloadUrl": { group: "default", points: 1 },
         "getGitpodTokens": { group: "default", points: 1 },
@@ -105,6 +121,7 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
         "sendFeedback": { group: "default", points: 1 },
         "registerGithubApp": { group: "default", points: 1 },
         "takeSnapshot": { group: "default", points: 1 },
+        "waitForSnapshot": { group: "default", points: 1 },
         "getSnapshots": { group: "default", points: 1 },
         "storeLayout": { group: "default", points: 1 },
         "getLayout": { group: "default", points: 1 },
@@ -120,11 +137,18 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
         "adminDeleteUser": { group: "default", points: 1 },
         "adminModifyRoleOrPermission": { group: "default", points: 1 },
         "adminModifyPermanentWorkspaceFeatureFlag": { group: "default", points: 1 },
+        "adminGetTeamById": { group: "default", points: 1 },
         "adminGetWorkspaces": { group: "default", points: 1 },
         "adminGetWorkspace": { group: "default", points: 1 },
         "adminForceStopWorkspace": { group: "default", points: 1 },
         "adminRestoreSoftDeletedWorkspace": { group: "default", points: 1 },
+        "adminGetProjectsBySearchTerm": { group: "default", points: 1 },
+        "adminGetProjectById": { group: "default", points: 1 },
+        "adminFindPrebuilds": { group: "default", points: 1 },
         "adminSetLicense": { group: "default", points: 1 },
+        "adminGetSettings": { group: "default", points: 1 },
+        "adminUpdateSettings": { group: "default", points: 1 },
+        "adminGetTelemetryData": {group: "default", points: 1},
 
         "validateLicense": { group: "default", points: 1 },
         "getLicenseInfo": { group: "default", points: 1 },
@@ -132,7 +156,7 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
 
         "accessCodeSyncStorage": { group: "default", points: 1 },
 
-        accesHeadlessLogs: { group: "default", points: 1 },
+        accessHeadlessLogs: { group: "default", points: 1 },
 
         "adminAddStudentEmailDomain":  { group: "default", points: 1 },
         "adminGetAccountStatement":  { group: "default", points: 1 },
@@ -146,12 +170,10 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
         "getAvailableCoupons":  { group: "default", points: 1 },
         "getChargebeeSiteId":  { group: "default", points: 1 },
         "getGithubUpgradeUrls":  { group: "default", points: 1 },
-        "getPrivateRepoTrialEndDate":  { group: "default", points: 1 },
         "getRemainingUsageHours":  { group: "default", points: 1 },
         "getShowPaymentUI":  { group: "default", points: 1 },
         "isChargebeeCustomer":  { group: "default", points: 1 },
         "isStudent":  { group: "default", points: 1 },
-        "mayAccessPrivateRepo":  { group: "default", points: 1 },
         "subscriptionCancel":  { group: "default", points: 1 },
         "subscriptionCancelDowngrade":  { group: "default", points: 1 },
         "subscriptionDowngradeTo":  { group: "default", points: 1 },
@@ -165,6 +187,9 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
         "tsReactivateSlot":  { group: "default", points: 1 },
         "tsReassignSlot":  { group: "default", points: 1 },
         "trackEvent":  { group: "default", points: 1 },
+        "trackLocation": { group: "default", points: 1},
+        "identifyUser": { group: "default", points: 1},
+        "getIDEOptions": { group: "default", points: 1 },
     };
 
     return {

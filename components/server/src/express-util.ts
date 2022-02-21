@@ -4,50 +4,11 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-import { WsRequestHandler } from './express/ws-handler';
-import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
 import { URL } from 'url';
 import * as express from 'express';
 import * as crypto from 'crypto';
 import { GitpodHostUrl } from '@gitpod/gitpod-protocol/lib/util/gitpod-host-url';
-
-export const pingPong: WsRequestHandler = (ws, req, next) => {
-    let pingSentTimer: any;
-    const timer = setInterval(() => {
-        if (ws.readyState !== ws.OPEN) {
-            return;
-        }
-        // wait 10 secs for a pong
-        pingSentTimer = setTimeout(() => {
-            // Happens very often, we do not want to spam the logs here
-            ws.terminate();
-        }, 10000);
-        ws.ping();
-    }, 30000)
-    ws.on('pong', () => {
-        if (pingSentTimer) {
-            clearTimeout(pingSentTimer);
-        }
-    });
-    ws.on('ping', (data) => {
-        // answer browser-side ping to conform RFC6455 (https://tools.ietf.org/html/rfc6455#section-5.5.2)
-        ws.pong(data);
-    });
-    ws.on('close', () => {
-        clearInterval(timer);
-    })
-    next();
-}
-
-export const handleError: WsRequestHandler = (ws, req, next) => {
-    ws.on('error', (err: any) => {
-        if (err.code !== 'ECONNRESET') {
-            log.error('Websocket error', err, { ws, req });
-        }
-        ws.terminate();
-    });
-    next();
-}
+import * as session from 'express-session';
 
 export const query = (...tuples: [string, string][]) => {
     if (tuples.length === 0) {
@@ -101,8 +62,7 @@ const looksLikeWorkspaceHostname = (originHostname: URL, gitpodHostName: string)
     return false;
 };
 
-export function saveSession(reqOrSession: express.Request | Express.Session): Promise<void> {
-    const session = reqOrSession.session ? reqOrSession.session : reqOrSession;
+export function saveSession(session: session.Session): Promise<void> {
     return new Promise<void>((resolve, reject) => {
         session.save((err: any) => {
             if (err) {
@@ -113,8 +73,7 @@ export function saveSession(reqOrSession: express.Request | Express.Session): Pr
         });
     });
 }
-export function destroySession(reqOrSession: express.Request | Express.Session): Promise<void> {
-    const session = reqOrSession.session ? reqOrSession.session : reqOrSession;
+export function destroySession(session: session.Session): Promise<void> {
     return new Promise<void>((resolve, reject) => {
         session.destroy((error: any) => {
             if (error) {
@@ -147,9 +106,67 @@ export function getRequestingClientInfo(req: express.Request) {
  * @param handler
  * @returns
  */
-export function asyncHandler(handler: (req: express.Request, res: express.Response, next?: express.NextFunction) => Promise<void>): express.Handler {
+export function asyncHandler(handler: (req: express.Request, res: express.Response, next: express.NextFunction) => Promise<void>): express.Handler {
     return (req: express.Request, res: express.Response, next: express.NextFunction) => {
-        handler(req, res)
+        handler(req, res, next)
             .catch(err => next(err));
     }
 }
+
+/**
+ * Turns all unhandled requests into an error
+ * @param req
+ * @param res
+ * @param next
+ * @returns
+ */
+export function unhandledToError(req: express.Request, res: express.Response, next: express.NextFunction) {
+    if (isAnsweredRequest(req, res)) {
+        return next();
+    }
+    return next(new Error("unhandled request: " + req.method + " " + req.originalUrl));
+}
+
+/**
+ * Logs all errors, and responds unanswered requests.
+ * @param log
+ */
+export function bottomErrorHandler(log: (...args: any[]) => void): express.ErrorRequestHandler {
+    return (err: any, req: express.Request, response: express.Response, next: express.NextFunction) => {
+        if (!err) {
+            return next();
+        }
+
+        let msg = "undefined";
+        let status = 500;
+        if (err instanceof Error) {
+            msg = err.toString() + "\nStack: " + err.stack;
+            status = typeof (err as any).status === 'number' ? (err as any).status : 500;
+        } else {
+            msg = err.toString();
+        }
+        log({ sessionId: req.sessionID }, err, {
+            originalUrl: req.originalUrl,
+            headers: req.headers,
+            cookies: req.cookies,
+            session: req.session
+        });
+        if (!isAnsweredRequest(req, response)) {
+            response.status(status).send({ error: msg });
+        }
+    }
+}
+
+export function isAnsweredRequest(req: express.Request, res: express.Response) {
+    return res.headersSent || req.originalUrl.endsWith(".websocket");
+}
+
+export const takeFirst = (h: string | string[] | undefined): string | undefined => {
+    if (Array.isArray(h)) {
+        if (h.length < 1) {
+            return undefined
+        }
+        return h[0];
+    }
+    return h;
+};

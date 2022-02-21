@@ -8,6 +8,7 @@
 import * as express from 'express';
 import { AuthProviderInfo, User, OAuth2Config, AuthProviderEntry } from "@gitpod/gitpod-protocol";
 import { saveSession } from '../express-util';
+import { Session } from '../express';
 
 import { UserEnvVarValue } from "@gitpod/gitpod-protocol";
 
@@ -39,17 +40,21 @@ export interface AuthProviderParams extends AuthProviderEntry {
     readonly icon: string;
 }
 export function parseAuthProviderParamsFromEnv(json: object): AuthProviderParams[] {
-    const result: AuthProviderParams[] = [];
     if (Array.isArray(json)) {
-        for (const o of json) {
-            result.push({
-                ...o,
-                ownerId: "",
-                builtin: true,
-                status: "verified",
-                verified: true,
-            })
-        }
+        return normalizeAuthProviderParams(json as AuthProviderParams[]);
+    }
+    return [];
+}
+export function normalizeAuthProviderParams(params: Omit<AuthProviderParams, "ownerId" | "builtin" | "status" | "verified">[]): AuthProviderParams[] {
+    const result: AuthProviderParams[] = [];
+    for (const p of params) {
+        result.push({
+            ...p,
+            ownerId: "",
+            builtin: true,
+            status: "verified",
+            verified: true,
+        })
     }
     return result;
 }
@@ -72,7 +77,7 @@ export interface AuthUser {
 export const AuthProvider = Symbol('AuthProvider');
 export interface AuthProvider {
     readonly authProviderId: string;
-    readonly config: AuthProviderParams;
+    readonly params: AuthProviderParams;
     readonly info: AuthProviderInfo;
     readonly authCallbackPath: string;
     callback(req: express.Request, res: express.Response, next: express.NextFunction): Promise<void>;
@@ -86,19 +91,18 @@ export interface AuthFlow {
     readonly overrideScopes?: boolean;
 }
 export namespace AuthFlow {
-    const storageKey = "authFlow";
-    export function get(session: Express.Session | undefined): AuthFlow | undefined {
+    export function get(session: Session | undefined): AuthFlow | undefined {
         if (session) {
-            return session[storageKey] as AuthFlow | undefined;
+            return session.authFlow;
         }
     }
-    export async function attach(session: Express.Session, authFlow: AuthFlow): Promise<void> {
-        session[storageKey] = authFlow;
+    export async function attach(session: Session, authFlow: AuthFlow): Promise<void> {
+        session.authFlow = authFlow;
         return saveSession(session);
     }
-    export async function clear(session: Express.Session | undefined) {
+    export async function clear(session: Session | undefined) {
         if (session) {
-            session[storageKey] = undefined;
+            session.authFlow = undefined;
             return saveSession(session);
         }
     }

@@ -6,14 +6,14 @@
 
 import {
     User, WorkspaceInfo, WorkspaceCreationResult, WorkspaceInstanceUser,
-    WhitelistedRepository, WorkspaceImageBuild, AuthProviderInfo, Branding, CreateWorkspaceMode,
+    WhitelistedRepository, WorkspaceImageBuild, AuthProviderInfo, CreateWorkspaceMode,
     Token, UserEnvVarValue, ResolvePluginsParams, PreparePluginUploadParams, Terms,
     ResolvedPlugins, Configuration, InstallPluginsParams, UninstallPluginParams, UserInfo, GitpodTokenType,
-    GitpodToken, AuthProviderEntry, GuessGitTokenScopesParams, GuessedGitTokenScopes
+    GitpodToken, AuthProviderEntry, GuessGitTokenScopesParams, GuessedGitTokenScopes, ProjectEnvVar
 } from './protocol';
 import {
     Team, TeamMemberInfo,
-    TeamMembershipInvite, Project, PrebuildInfo, TeamMemberRole
+    TeamMembershipInvite, Project, TeamMemberRole, PrebuildWithStatus, StartPrebuildResult, PartialProject
 } from './teams-projects-protocol';
 import { JsonRpcProxy, JsonRpcServer } from './messaging/proxy-factory';
 import { Disposable, CancellationTokenSource } from 'vscode-jsonrpc';
@@ -28,11 +28,15 @@ import { Emitter } from './util/event';
 import { AccountStatement, CreditAlert } from './accounting-protocol';
 import { GithubUpgradeURL, PlanCoupon } from './payment-protocol';
 import { TeamSubscription, TeamSubscriptionSlot, TeamSubscriptionSlotResolved } from './team-subscription-protocol';
-import { RemoteTrackMessage } from './analytics';
+import { RemotePageMessage, RemoteTrackMessage, RemoteIdentifyMessage } from './analytics';
+import { IDEServer } from './ide-protocol';
+import { InstallationAdminSettings, TelemetryData } from './installation-admin-protocol';
 
 export interface GitpodClient {
     onInstanceUpdate(instance: WorkspaceInstance): void;
     onWorkspaceImageBuildLogs: WorkspaceImageBuild.LogCallback;
+
+    onPrebuildUpdate(update: PrebuildWithStatus): void;
 
     onCreditAlert(creditAlert: CreditAlert): void;
 
@@ -43,7 +47,7 @@ export interface GitpodClient {
 }
 
 export const GitpodServer = Symbol('GitpodServer');
-export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, LicenseService {
+export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, LicenseService, IDEServer {
     // User related API
     getLoggedInUser(): Promise<User>;
     getTerms(): Promise<Terms>;
@@ -52,9 +56,9 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     getOwnAuthProviders(): Promise<AuthProviderEntry[]>;
     updateOwnAuthProvider(params: GitpodServer.UpdateOwnAuthProviderParams): Promise<AuthProviderEntry>;
     deleteOwnAuthProvider(params: GitpodServer.DeleteOwnAuthProviderParams): Promise<void>;
-    getBranding(): Promise<Branding>;
     getConfiguration(): Promise<Configuration>;
     getToken(query: GitpodServer.GetTokenSearchOptions): Promise<Token | undefined>;
+    getGitpodTokenScopes(tokenHash: string): Promise<string[]>;
     /**
      * @deprecated
      */
@@ -68,8 +72,15 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     getWorkspaceOwner(workspaceId: string): Promise<UserInfo | undefined>;
     getWorkspaceUsers(workspaceId: string): Promise<WorkspaceInstanceUser[]>;
     getFeaturedRepositories(): Promise<WhitelistedRepository[]>;
+    getSuggestedContextURLs(): Promise<string[]>;
+    /**
+     * **Security:**
+     * Sensitive information like an owner token is erased, since it allows access for all team members.
+     * If you need to access an owner token use `getOwnerToken` instead.
+     */
     getWorkspace(id: string): Promise<WorkspaceInfo>;
     isWorkspaceOwner(workspaceId: string): Promise<boolean>;
+    getOwnerToken(workspaceId: string): Promise<string>;
 
     /**
      * Creates and starts a workspace for the given context URL.
@@ -120,6 +131,12 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     removeTeamMember(teamId: string, userId: string): Promise<void>;
     getGenericInvite(teamId: string): Promise<TeamMembershipInvite>;
     resetGenericInvite(inviteId: string): Promise<TeamMembershipInvite>;
+    deleteTeam(teamId: string, userId: string): Promise<void>;
+
+    // Admin Settings
+    adminGetSettings(): Promise<InstallationAdminSettings>;
+    adminUpdateSettings(settings: InstallationAdminSettings): Promise<void>;
+    adminGetTelemetryData(): Promise<TelemetryData>;
 
     // Projects
     getProviderRepositoriesForUser(params: GetProviderRepositoriesParams): Promise<ProviderRepository[]>;
@@ -128,10 +145,18 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     getTeamProjects(teamId: string): Promise<Project[]>;
     getUserProjects(): Promise<Project[]>;
     getProjectOverview(projectId: string): Promise<Project.Overview | undefined>;
-    findPrebuilds(params: FindPrebuildsParams): Promise<PrebuildInfo[]>;
-    triggerPrebuild(projectId: string, branch: string): Promise<void>;
-    setProjectConfiguration(projectId: string, configString: string): Promise<void>;
+    findPrebuilds(params: FindPrebuildsParams): Promise<PrebuildWithStatus[]>;
+    triggerPrebuild(projectId: string, branchName: string | null): Promise<StartPrebuildResult>;
+    cancelPrebuild(projectId: string, prebuildId: string): Promise<void>;
     fetchProjectRepositoryConfiguration(projectId: string): Promise<string | undefined>;
+    guessProjectConfiguration(projectId: string): Promise<string | undefined>;
+    fetchRepositoryConfiguration(cloneUrl: string): Promise<string | undefined>;
+    guessRepositoryConfiguration(cloneUrl: string): Promise<string | undefined>;
+    setProjectConfiguration(projectId: string, configString: string): Promise<void>;
+    updateProjectPartial(partialProject: PartialProject): Promise<void>;
+    setProjectEnvironmentVariable(projectId: string, name: string, value: string, censored: boolean): Promise<void>;
+    getProjectEnvironmentVariables(projectId: string): Promise<ProjectEnvVar[]>;
+    deleteProjectEnvironmentVariable(variableId: string): Promise<void>;
 
     // content service
     getContentBlobUploadUrl(name: string): Promise<string>
@@ -147,10 +172,15 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     registerGithubApp(installationId: string): Promise<void>;
 
     /**
-     * Stores a new snapshot for the given workspace and bucketId
+     * Stores a new snapshot for the given workspace and bucketId. Returns _before_ the actual snapshot is done. To wait for that, use `waitForSnapshot`.
      * @return the snapshot id
      */
     takeSnapshot(options: GitpodServer.TakeSnapshotOptions): Promise<string>;
+    /**
+     *
+     * @param snapshotId
+     */
+    waitForSnapshot(snapshotId: string): Promise<void>;
 
     /**
      * Returns the list of snapshots that exist for a workspace.
@@ -182,8 +212,6 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
      * gitpod.io concerns
      */
     isStudent(): Promise<boolean>;
-    getPrivateRepoTrialEndDate(): Promise<string | undefined>;
-
     /**
      *
      */
@@ -201,7 +229,6 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
 
     getShowPaymentUI(): Promise<boolean>;
     isChargebeeCustomer(): Promise<boolean>;
-    mayAccessPrivateRepo(): Promise<boolean>;
 
     subscriptionUpgradeTo(subscriptionId: string, chargebeePlanId: string): Promise<void>;
     subscriptionDowngradeTo(subscriptionId: string, chargebeePlanId: string): Promise<void>;
@@ -223,10 +250,23 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
      * Analytics
      */
     trackEvent(event: RemoteTrackMessage): Promise<void>;
+    trackLocation(event: RemotePageMessage): Promise<void>;
+    identifyUser(event: RemoteIdentifyMessage): Promise<void>;
+}
+
+export interface RateLimiterError {
+    method?: string,
+
+    /**
+     * Retry after this many seconds, earliest.
+     * cmp.: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
+     */
+    retryAfter: number,
 }
 
 export interface CreateProjectParams {
     name: string;
+    slug?: string;
     account: string;
     provider: string;
     cloneUrl: string;
@@ -239,6 +279,8 @@ export interface FindPrebuildsParams {
     branch?: string;
     latest?: boolean;
     prebuildId?: string;
+    // default: 30
+    limit?: number;
 }
 export interface GetProviderRepositoriesParams {
     provider: string;
@@ -246,6 +288,7 @@ export interface GetProviderRepositoriesParams {
 }
 export interface ProviderRepository {
     name: string;
+    path?: string;
     account: string;
     accountAvatarUrl: string;
     cloneUrl: string;
@@ -253,7 +296,14 @@ export interface ProviderRepository {
     installationId?: number;
     installationUpdatedAt?: string;
 
-    inUse?: boolean;
+    inUse?: { userName: string };
+}
+
+export interface ClientHeaderFields {
+    ip?: string;
+    userAgent?: string;
+    dnt?: string;
+    clientRegion?: string;
 }
 
 export const WorkspaceTimeoutValues = ["30m", "60m", "180m"] as const;
@@ -299,7 +349,8 @@ export namespace GitpodServer {
         limit?: number;
         searchString?: string;
         pinnedOnly?: boolean;
-        projectId?: string;
+        projectId?: string | string[];
+        includeWithoutProject?: boolean;
     }
     export interface GetAccountStatementOptions {
         date?: string;
@@ -315,6 +366,8 @@ export namespace GitpodServer {
     export interface TakeSnapshotOptions {
         workspaceId: string;
         layoutData?: string;
+        /* this is here to enable backwards-compatibility and untangling rollout between workspace, IDE and meta */
+        dontWait?: boolean;
     }
     export interface GetUserStorageResourceOptions {
         readonly uri: string;
@@ -356,10 +409,12 @@ export class GitpodCompositeClient<Client extends GitpodClient> implements Gitpo
 
     public registerClient(client: Partial<Client>): Disposable {
         this.clients.push(client);
-        const index = this.clients.length;
         return {
             dispose: () => {
-                this.clients.slice(index, 1);
+                const index = this.clients.indexOf(client);
+                if (index > -1) {
+                    this.clients.splice(index, 1);
+                }
             }
         }
     }
@@ -369,6 +424,18 @@ export class GitpodCompositeClient<Client extends GitpodClient> implements Gitpo
             if (client.onInstanceUpdate) {
                 try {
                     client.onInstanceUpdate(instance);
+                } catch (error) {
+                    console.error(error)
+                }
+            }
+        }
+    }
+
+    onPrebuildUpdate(update: PrebuildWithStatus): void {
+        for (const client of this.clients) {
+            if (client.onPrebuildUpdate) {
+                try {
+                    client.onPrebuildUpdate(update);
                 } catch (error) {
                     console.error(error)
                 }
@@ -537,7 +604,7 @@ export class WorkspaceInstanceUpdateListener {
 }
 
 export interface GitpodServiceOptions {
-    onReconnect?: () => (void | Promise<void>)
+    onReconnect?: () => (void | Promise<void>)
 }
 
 export class GitpodServiceImpl<Client extends GitpodClient, Server extends GitpodServer> {

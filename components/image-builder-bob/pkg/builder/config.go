@@ -8,12 +8,11 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/moby/buildkit/client"
+	"golang.org/x/xerrors"
 )
 
 // Config configures a builder
@@ -46,76 +45,58 @@ func GetConfigFromEnv() (*Config, error) {
 	}
 
 	if cfg.BaseRef == "" {
-		return nil, fmt.Errorf("BOB_BASE_REF must not be empty")
+		cfg.BaseRef = "localhost:8080/base:latest"
 	}
 	if cfg.TargetRef == "" {
-		return nil, fmt.Errorf("BOB_TARGET_REF must not be empty")
+		cfg.TargetRef = "localhost:8080/target:latest"
 	}
 	if cfg.BuildBase {
 		if cfg.Dockerfile == "" {
-			return nil, fmt.Errorf("When building the base image BOB_DOCKERFILE_PATH is mandatory")
+			return nil, xerrors.Errorf("When building the base image BOB_DOCKERFILE_PATH is mandatory")
 		}
 		var err error
 		cfg.Dockerfile, err = filepath.Abs(cfg.Dockerfile)
 		if err != nil {
-			return nil, fmt.Errorf("cannot make BOB_DOCKERFILE_PATH absolute: %w", err)
+			return nil, xerrors.Errorf("cannot make BOB_DOCKERFILE_PATH absolute: %w", err)
 		}
 		if !strings.HasPrefix(cfg.Dockerfile, "/workspace") {
-			return nil, fmt.Errorf("BOB_DOCKERFILE_PATH must begin with /workspace")
+			return nil, xerrors.Errorf("BOB_DOCKERFILE_PATH must begin with /workspace")
 		}
 		if stat, err := os.Stat(cfg.Dockerfile); err != nil || stat.IsDir() {
-			return nil, fmt.Errorf("BOB_DOCKERFILE_PATH does not exist or isn't a file")
+			return nil, xerrors.Errorf("BOB_DOCKERFILE_PATH does not exist or isn't a file")
 		}
 	}
 
 	var authKey = os.Getenv("BOB_AUTH_KEY")
 	if authKey != "" {
 		if len(authKey) != 32 {
-			return nil, fmt.Errorf("BOB_AUTH_KEY must be exactly 32 bytes long")
+			return nil, xerrors.Errorf("BOB_AUTH_KEY must be exactly 32 bytes long")
 		}
 
 		// we have an authkey, hence assume that the auth fields are base64 encoded and encrypted
 		if cfg.BaseLayerAuth != "" {
-			dec := make([]byte, base64.RawStdEncoding.DecodedLen(len(cfg.BaseLayerAuth)))
-			_, err := base64.RawStdEncoding.Decode(dec, []byte(cfg.BaseLayerAuth))
+			dec, err := base64.RawStdEncoding.DecodeString(cfg.BaseLayerAuth)
 			if err != nil {
-				return nil, fmt.Errorf("BOB_BASELAYER_AUTH is not base64 encoded but BOB_AUTH_KEY is present")
+				return nil, xerrors.Errorf("BOB_BASELAYER_AUTH is not base64 encoded but BOB_AUTH_KEY is present")
 			}
 			cfg.BaseLayerAuth, err = decrypt(dec, authKey)
 			if err != nil {
-				return nil, fmt.Errorf("cannot decrypt BOB_BASELAYER_AUTH: %w", err)
+				return nil, xerrors.Errorf("cannot decrypt BOB_BASELAYER_AUTH: %w", err)
 			}
 		}
 		if cfg.WorkspaceLayerAuth != "" {
-			dec := make([]byte, base64.RawStdEncoding.DecodedLen(len(cfg.WorkspaceLayerAuth)))
-			_, err := base64.RawStdEncoding.Decode(dec, []byte(cfg.WorkspaceLayerAuth))
+			dec, err := base64.RawStdEncoding.DecodeString(cfg.WorkspaceLayerAuth)
 			if err != nil {
-				return nil, fmt.Errorf("BOB_WSLAYER_AUTH is not base64 encoded but BOB_AUTH_KEY is present")
+				return nil, xerrors.Errorf("BOB_WSLAYER_AUTH is not base64 encoded but BOB_AUTH_KEY is present")
 			}
 			cfg.WorkspaceLayerAuth, err = decrypt(dec, authKey)
 			if err != nil {
-				return nil, fmt.Errorf("cannot decrypt BOB_WSLAYER_AUTH: %w", err)
+				return nil, xerrors.Errorf("cannot decrypt BOB_WSLAYER_AUTH: %w", err)
 			}
 		}
 	}
 
 	return cfg, nil
-}
-
-// LocalCacheImport produces a cache option that imports from a local cache
-func (c Config) LocalCacheImport() []client.CacheOptionsEntry {
-	if c.localCacheImport == "" {
-		return nil
-	}
-
-	return []client.CacheOptionsEntry{
-		{
-			Type: "local",
-			Attrs: map[string]string{
-				"src": c.localCacheImport,
-			},
-		},
-	}
 }
 
 // source: https://astaxie.gitbooks.io/build-web-application-with-golang/en/09.6.html
@@ -132,7 +113,7 @@ func decrypt(ciphertext []byte, key string) (string, error) {
 
 	nonceSize := gcm.NonceSize()
 	if len(ciphertext) < nonceSize {
-		return "", fmt.Errorf("ciphertext too short")
+		return "", xerrors.Errorf("ciphertext too short")
 	}
 
 	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]

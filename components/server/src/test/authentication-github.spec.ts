@@ -7,8 +7,7 @@
 import { suite, test } from "mocha-typescript";
 
 import * as chai from 'chai';
-const chaiHttp = require('chai-http');
-
+import chaiHttp = require('chai-http');
 import * as http from "http";
 import * as express from "express";
 import { Server } from "../server"
@@ -49,7 +48,7 @@ type TestApp = {
         container.load(productionContainerModule);
         container.load(dbContainerModule);
         const server = container.get(Server);
-        server.init(app);
+        server.init(app).catch(err => {/** ignore */});
         const httpServer = app.listen(3000, "localhost");
 
         return { httpServer, app, server };

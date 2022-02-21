@@ -18,8 +18,7 @@ import { runInNewContext } from "vm";
 import { AuthFlow, AuthProvider } from "../auth/auth-provider";
 import { AuthProviderParams, AuthUserSetup } from "../auth/auth-provider";
 import { AuthException, EmailAddressAlreadyTakenException, SelectAccountException, UnconfirmedUserException } from "../auth/errors";
-import { GitpodCookie } from "./gitpod-cookie";
-import { Env } from "../env";
+import { Config } from '../config';
 import { getRequestingClientInfo } from "../express-util";
 import { TokenProvider } from '../user/token-provider';
 import { UserService } from "../user/user-service";
@@ -27,13 +26,14 @@ import { AuthProviderService } from './auth-provider-service';
 import { LoginCompletionHandler } from './login-completion-handler';
 import { TosFlow } from '../terms/tos-flow';
 import { increaseLoginCounter } from '../../src/prometheus-metrics';
+import { OutgoingHttpHeaders } from 'http2';
 
 /**
  * This is a generic implementation of OAuth2-based AuthProvider.
  * --
  * The main entrypoints go along the phases of the OAuth2 Authorization Code Flow:
  *
- * 1. `authorize` – this is called by the `Authenticator` to handle login/authorization requests.
+ * 1. `authorize` – this is called by the `Authenticator` to handle login/authorization requests.
  *
  *   The OAuth2 library under the hood will redirect send a redirect response to initialize the OAuth2 flow with the
  *   authorization service.
@@ -58,11 +58,10 @@ import { increaseLoginCounter } from '../../src/prometheus-metrics';
 @injectable()
 export class GenericAuthProvider implements AuthProvider {
 
-    @inject(AuthProviderParams) config: AuthProviderParams;
+    @inject(AuthProviderParams) params: AuthProviderParams;
     @inject(TokenProvider) protected readonly tokenProvider: TokenProvider;
     @inject(UserDB) protected userDb: UserDB;
-    @inject(Env) protected env: Env;
-    @inject(GitpodCookie) protected gitpodCookie: GitpodCookie;
+    @inject(Config) protected config: Config;
     @inject(UserService) protected readonly userService: UserService;
     @inject(AuthProviderService) protected readonly authProviderService: AuthProviderService;
     @inject(LoginCompletionHandler) protected readonly loginCompletionHandler: LoginCompletionHandler;
@@ -79,7 +78,7 @@ export class GenericAuthProvider implements AuthProvider {
 
     protected defaultInfo(): AuthProviderInfo {
         const scopes = this.oauthScopes;
-        const { id, type, icon, host, ownerId, verified, hiddenOnDashboard, disallowLogin, description, loginContextMatcher } = this.config;
+        const { id, type, icon, host, ownerId, verified, hiddenOnDashboard, disallowLogin, description, loginContextMatcher } = this.params;
         return {
             authProviderId: id,
             authProviderType: type,
@@ -109,13 +108,13 @@ export class GenericAuthProvider implements AuthProvider {
         return `Auth-With-${this.host}`;
     }
     get host() {
-        return this.config.host;
+        return this.params.host;
     }
     get authProviderId() {
-        return this.config.id;
+        return this.params.id;
     }
     protected get oauthConfig() {
-        return this.config.oauth!;
+        return this.params.oauth!;
     }
     protected get oauthScopes() {
         if (!this.oauthConfig.scope) {
@@ -239,8 +238,13 @@ export class GenericAuthProvider implements AuthProvider {
         }
     }
 
+    protected cachedAuthCallbackPath: string | undefined = undefined;
     get authCallbackPath() {
-        return new URL(this.oauthConfig.callBackUrl).pathname;
+        // This ends up being called quite often so we cache the URL constructor
+        if (this.cachedAuthCallbackPath === undefined) {
+            this.cachedAuthCallbackPath = new URL(this.oauthConfig.callBackUrl).pathname;
+        }
+        return this.cachedAuthCallbackPath;
     }
 
 
@@ -270,7 +274,7 @@ export class GenericAuthProvider implements AuthProvider {
         if (isAlreadyLoggedIn) {
             if (!authFlow) {
                 log.warn(cxt, `(${strategyName}) User is already logged in. No auth info provided. Redirecting to dashboard.`, { request, clientInfo });
-                response.redirect(this.env.hostUrl.asDashboard().toString());
+                response.redirect(this.config.hostUrl.asDashboard().toString());
                 return;
             }
         }
@@ -318,7 +322,7 @@ export class GenericAuthProvider implements AuthProvider {
             response.redirect(this.getSorryUrl(`OAuth2 error. (${error})`));
             return;
         }
-        const [err, user, flowContext] = result;
+        const [err, userOrIdentity, flowContext] = result;
 
         /*
          * (3) this callback function is called after the "verify" function as the final step in the authentication process in passport.
@@ -336,7 +340,7 @@ export class GenericAuthProvider implements AuthProvider {
          * - redirect to `returnTo` (from request parameter)
          */
 
-        const context = LogContext.from( { user: User.is(user) ? { userId: user.id } : undefined, request} );
+        const context = LogContext.from( { user: User.is(userOrIdentity) ? { userId: userOrIdentity.id } : undefined, request} );
 
         if (err) {
             await AuthFlow.clear(request.session);
@@ -346,7 +350,7 @@ export class GenericAuthProvider implements AuthProvider {
                 return this.sendCompletionRedirectWithError(response, err.payload);
             }
             if (EmailAddressAlreadyTakenException.is(err)) {
-                return this.sendCompletionRedirectWithError(response, { error: "email_taken" });
+                return this.sendCompletionRedirectWithError(response, { error: "email_taken", host: err.payload?.host });
             }
 
             let message = 'Authorization failed. Please try again.';
@@ -357,11 +361,11 @@ export class GenericAuthProvider implements AuthProvider {
                 message = 'OAuth Error. Please try again.'; // this is a 5xx response from authorization service
             }
 
-            if (!UnconfirmedUserException.is(err)) {
-                // user did not accept ToS. Don't count this towards the error burn rate.
-                increaseLoginCounter("failed", this.host);
+            if (UnconfirmedUserException.is(err)) {
+                return this.sendCompletionRedirectWithError(response, { error: err.message });
             }
 
+            increaseLoginCounter("failed", this.host);
             log.error(context, `(${strategyName}) Redirect to /sorry from verify callback`, err, { ...defaultLogPayload, err });
             response.redirect(this.getSorryUrl(message));
             return;
@@ -378,7 +382,7 @@ export class GenericAuthProvider implements AuthProvider {
                 // attach the sign up info to the session, in order to proceed after acceptance of terms
                 await TosFlow.attach(request.session!, flowContext);
 
-                response.redirect(this.env.hostUrl.withApi({ pathname: '/tos', search: "mode=login" }).toString());
+                response.redirect(this.config.hostUrl.withApi({ pathname: '/tos', search: "mode=login" }).toString());
                 return;
             } else  {
                 const { user, elevateScopes } = flowContext as TosFlow.WithUser;
@@ -394,7 +398,7 @@ export class GenericAuthProvider implements AuthProvider {
     protected sendCompletionRedirectWithError(response: express.Response, error: object): void {
         log.info(`(${this.strategyName}) Send completion redirect with error`, { error });
 
-        const url = this.env.hostUrl.with({ pathname: '/complete-auth', search: "message=error:" + Buffer.from(JSON.stringify(error), "utf-8").toString('base64') }).toString();
+        const url = this.config.hostUrl.with({ pathname: '/complete-auth', search: "message=error:" + Buffer.from(JSON.stringify(error), "utf-8").toString('base64') }).toString();
         response.redirect(url);
     }
 
@@ -407,9 +411,10 @@ export class GenericAuthProvider implements AuthProvider {
      * - it's expected to identify missing requirements, e.g. missing terms acceptance
      * - finally, it's expected to call `done` and provide the computed result in order to finalize the auth process
      */
-    protected async verify(req: express.Request, accessToken: string, refreshToken: string | undefined, tokenResponse: any, _profile: undefined, done: VerifyCallback) {
+    protected async verify(req: express.Request, accessToken: string, refreshToken: string | undefined, tokenResponse: any, _profile: undefined, _done: VerifyCallbackInternal) {
+        const done = _done as VerifyCallback;
         let flowContext: VerifyResult;
-        const { strategyName, config } = this;
+        const { strategyName, params: config } = this;
         const clientInfo = getRequestingClientInfo(req);
         const authProviderId = this.authProviderId;
         const authFlow = AuthFlow.get(req.session)!; // asserted in `callback` allready
@@ -451,15 +456,12 @@ export class GenericAuthProvider implements AuthProvider {
                 if (!currentGitpodUser) {
 
                     // signup new accounts with email adresses already taken is disallowed
-                    const existingUserWithSameEmail = (await this.userDb.findUsersByEmail(primaryEmail))[0];
-                    if (existingUserWithSameEmail) {
-                        try {
-                            await this.userService.asserNoAccountWithEmail(primaryEmail);
-                        } catch (error) {
-                            log.warn(`Login attempt with matching email address.`, { ...defaultLogPayload, authUser, candidate, clientInfo });
-                            done(error, undefined);
-                            return;
-                        }
+                    try {
+                        await this.userService.asserNoAccountWithEmail(primaryEmail);
+                    } catch (error) {
+                        log.warn(`Login attempt with matching email address.`, { ...defaultLogPayload, authUser, candidate, clientInfo });
+                        done(error, undefined);
+                        return;
                     }
                 }
             }
@@ -573,7 +575,7 @@ export class GenericAuthProvider implements AuthProvider {
     }
 
     protected createGhProxyIdentity(originalIdentity: Identity) {
-        const githubTokenValue = this.config.params && this.config.params.githubToken;
+        const githubTokenValue = this.params.params && this.params.params.githubToken;
         if (!githubTokenValue) {
             return {};
         }
@@ -605,7 +607,7 @@ export class GenericAuthProvider implements AuthProvider {
 
     protected get defaultStrategyOptions(): StrategyOptionsWithRequest {
         const { authorizationUrl, tokenUrl, clientId, clientSecret, callBackUrl, scope, scopeSeparator, authorizationParams } = this.oauthConfig;
-        const augmentedAuthParams = this.env.devBranch ? { ...authorizationParams, state: this.env.devBranch } : authorizationParams;
+        const augmentedAuthParams = this.config.devBranch ? { ...authorizationParams, state: this.config.devBranch } : authorizationParams;
         return {
             authorizationURL: authorizationUrl,
             tokenURL: tokenUrl,
@@ -622,7 +624,7 @@ export class GenericAuthProvider implements AuthProvider {
     }
 
     protected getSorryUrl(message: string) {
-        return this.env.hostUrl.asSorry(message).toString();
+        return this.config.hostUrl.asSorry(message).toString();
     }
 
     protected retry = async <T>(fn: () => Promise<T>) => {
@@ -650,8 +652,8 @@ interface GenericOAuthStrategyOptions {
     userAgent: string;
 
     scopeSeparator?: string;
-    customHeaders?: any;
-    skipUserProfile?: true;
+    customHeaders?: OutgoingHttpHeaders;
+    skipUserProfile?: any;
     /**
      * Non-spec autorization params.
      */
@@ -661,6 +663,7 @@ interface GenericOAuthStrategyOptions {
 /**
  * Refinement of OAuth2Strategy.VerifyCallback
  */
+type VerifyCallbackInternal = (err?: Error | undefined, user?: User, info?: VerifyResult) => void
 type VerifyCallback = (err?: Error | undefined, user?: User | Identity, info?: VerifyResult) => void
 
 export interface StrategyOptionsWithRequest extends OAuth2Strategy.StrategyOptionsWithRequest, GenericOAuthStrategyOptions { }

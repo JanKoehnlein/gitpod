@@ -47,7 +47,7 @@ export class GitpodSessionTableDescriptionProvider implements TableDescriptionPr
 /**
  * BEWARE
  *
- * When updating this list, make sure you update the deleted-entry-gc in gitpod-db
+ * When updating this list, make sure you update the deleted-entry-gc.ts in gitpod-db
  * as well, if you're adding a table that needs some of its entries deleted.
  */
 @injectable()
@@ -180,11 +180,6 @@ export class GitpodTableDescriptionProvider implements TableDescriptionProvider 
             timeColumn: '_lastModified'
         },
         {
-            name: 'd_b_payment_source_info',
-            primaryKeys: ['id', 'resourceVersion'],
-            timeColumn: '_lastModified'
-        },
-        {
             name: 'd_b_gitpod_token',
             primaryKeys: ['tokenHash'],
             deletionColumn: 'deleted',
@@ -227,11 +222,47 @@ export class GitpodTableDescriptionProvider implements TableDescriptionProvider 
             timeColumn: '_lastModified',
         },
         {
+            name: 'd_b_team_membership_invite',
+            primaryKeys: ['id'],
+            deletionColumn: 'deleted',
+            timeColumn: '_lastModified',
+        },
+        {
             name: 'd_b_project',
             primaryKeys: ['id'],
             deletionColumn: 'deleted',
             timeColumn: '_lastModified',
         },
+        {
+            name: 'd_b_prebuild_info',
+            primaryKeys: ['prebuildId'],
+            deletionColumn: 'deleted',
+            timeColumn: '_lastModified',
+        },
+        {
+            name: 'd_b_oss_allow_list',
+            primaryKeys: ['identity'],
+            deletionColumn: 'deleted',
+            timeColumn: '_lastModified',
+        },
+        {
+            name: 'd_b_project_env_var',
+            primaryKeys: ['id', 'projectId'],
+            deletionColumn: 'deleted',
+            timeColumn: '_lastModified',
+        },
+        {
+            name: 'd_b_project_info',
+            primaryKeys: ['projectId'],
+            deletionColumn: 'deleted',
+            timeColumn: '_lastModified',
+        },
+        /**
+         * BEWARE
+         *
+         * When updating this list, make sure you update the deleted-entry-gc.ts in gitpod-db
+         * as well, if you're adding a table that needs some of its entries deleted.
+         */
     ]
 
     public getSortedTables(): TableDescription[] {

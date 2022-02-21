@@ -48,16 +48,30 @@ func GetKubeconfig(kubeconfig string) (res *rest.Config, namespace string, err e
 
 // FindAnyPodForComponent returns the first pod we found for a particular component
 func FindAnyPodForComponent(clientSet kubernetes.Interface, namespace, label string) (podName string, err error) {
+	ps, err := FindPodsForComponent(clientSet, namespace, label)
+	if err != nil {
+		return "", err
+	}
+	return ps[0], nil
+}
+
+// FindPodsForcomponent returns all pods we found for a particular component
+func FindPodsForComponent(clientSet kubernetes.Interface, namespace, label string) ([]string, error) {
 	pods, err := clientSet.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("component=%s", label),
 	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if len(pods.Items) == 0 {
-		return "", xerrors.Errorf("no pod in %s with label component=%s", namespace, label)
+		return nil, xerrors.Errorf("no pod in %s with label component=%s", namespace, label)
 	}
-	return pods.Items[0].Name, nil
+
+	res := make([]string, len(pods.Items))
+	for i, p := range pods.Items {
+		res[i] = p.Name
+	}
+	return res, nil
 }
 
 // ForwardPort establishes a TCP port forwarding to a Kubernetes pod
@@ -107,7 +121,7 @@ func ForwardPort(ctx context.Context, config *rest.Config, namespace, pod, port 
 		}
 
 		if errOut.Len() != 0 {
-			errchan <- fmt.Errorf(errOut.String())
+			errchan <- xerrors.Errorf(errOut.String())
 			return
 		}
 
@@ -128,7 +142,7 @@ func CertPoolFromSecret(clientSet kubernetes.Interface, namespace, secretName st
 		certFile := secret.Data[file]
 
 		if !cert.AppendCertsFromPEM(certFile) {
-			return nil, fmt.Errorf("credentials: failed to append certificates")
+			return nil, xerrors.Errorf("credentials: failed to append certificates")
 		}
 	}
 	return

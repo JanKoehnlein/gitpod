@@ -51,6 +51,11 @@ export interface WorkspaceInstance {
 
     // instance is hard-deleted on the database and about to be collected by db-sync
     readonly deleted?: boolean;
+
+    /**
+     * Contains information about the image build, if there was any
+     */
+     imageBuildInfo?: ImageBuildInfo;
 }
 
 // WorkspaceInstanceStatus describes the current state of a workspace instance
@@ -134,9 +139,6 @@ export interface WorkspaceInstanceConditions {
     // PullingImages marks if the workspace is currently pulling its images. This condition can only be set during PhaseCreating
     pullingImages?: boolean
 
-    // ServiceExists denotes if the workspace theia-/ports- services exist. This condition will be true if either of the two services exist.
-    serviceExists?: boolean
-
     // deployed marks that a workspace instance was sent/deployed at a workspace manager
     deployed?: boolean;
 
@@ -145,6 +147,12 @@ export interface WorkspaceInstanceConditions {
 
     // ISO8601 timestamp when the first user activity was registered in the frontend. Only set if the workspace is running.
     firstUserActivity?: string;
+
+    // headless_task_failed indicates that a headless workspace task failed
+    headlessTaskFailed?: string;
+
+    // stopped_by_request is true if the workspace was stopped using a StopWorkspace call
+    stoppedByRequest?: boolean;
 }
 
 // AdmissionLevel describes who can access a workspace instance and its ports.
@@ -157,9 +165,6 @@ export type PortVisibility = 'public' | 'private';
 export interface WorkspaceInstancePort {
     // The outward-facing port number
     port: number;
-
-    // An optional inward-facing port number. If not present we'll use port.
-    targetPort?: number;
 
     // The visiblity of this port. Optional for backwards compatibility.
     visibility?: PortVisibility;
@@ -206,4 +211,25 @@ export interface WorkspaceInstanceConfiguration {
 
     // ideImage is the ref of the IDE image this instance uses.
     ideImage: string;
+
+    // desktopIdeImage is the ref of the desktop IDE image this instance uses.
+    desktopIdeImage?: string
+
+    // supervisorImage is the ref of the supervisor image this instance uses.
+    supervisorImage?: string;
+}
+
+/**
+ * Holds information about the image build (if there was one) for this WorkspaceInstance
+ */
+export interface ImageBuildInfo {
+    log?: ImageBuildLogInfo,
+}
+
+/**
+ * Holds information about how to access logs for this an image build
+ */
+export interface ImageBuildLogInfo {
+    url: string,
+    headers: { [key: string]: string },
 }

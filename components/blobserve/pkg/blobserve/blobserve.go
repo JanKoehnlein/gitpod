@@ -14,6 +14,8 @@ import (
 	"io/ioutil"
 	"net/http"
 	"path/filepath"
+	"regexp"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -43,23 +45,27 @@ type BlobserveInlineVars struct {
 	SupervisorImage string `json:"supervisor"`
 }
 
+type BlobSpace struct {
+	Location string `json:"location"`
+	MaxSize  int64  `json:"maxSizeBytes,omitempty"`
+}
+
+type Repo struct {
+	PrePull      []string            `json:"prePull,omitempty"`
+	Workdir      string              `json:"workdir,omitempty"`
+	Replacements []StringReplacement `json:"replacements,omitempty"`
+	InlineStatic []InlineReplacement `json:"inlineStatic,omitempty"`
+}
+
 // Config configures a server.
 type Config struct {
-	Port    int           `json:"port"`
-	Timeout util.Duration `json:"timeout,omitempty"`
-	Repos   map[string]struct {
-		PrePull      []string            `json:"prePull,omitempty"`
-		Workdir      string              `json:"workdir,omitempty"`
-		Replacements []StringReplacement `json:"replacements,omitempty"`
-		InlineStatic []InlineReplacement `json:"inlineStatic,omitempty"`
-	} `json:"repos"`
+	Port    int             `json:"port"`
+	Timeout util.Duration   `json:"timeout,omitempty"`
+	Repos   map[string]Repo `json:"repos"`
 	// AllowAnyRepo enables users to access any repo/image, irregardles if they're listed in the
 	// ref config or not.
-	AllowAnyRepo bool `json:"allowAnyRepo"`
-	BlobSpace    struct {
-		Location string `json:"location"`
-		MaxSize  int64  `json:"maxSizeBytes,omitempty"`
-	} `json:"blobSpace"`
+	AllowAnyRepo bool      `json:"allowAnyRepo"`
+	BlobSpace    BlobSpace `json:"blobSpace"`
 }
 
 type StringReplacement struct {
@@ -72,6 +78,42 @@ type InlineReplacement struct {
 	Search      string `json:"search"`
 	Replacement string `json:"replacement"`
 }
+
+// From https://github.com/distribution/distribution/blob/v2.7.1/reference/regexp.go
+var match = regexp.MustCompile
+
+func expression(res ...*regexp.Regexp) *regexp.Regexp {
+	var s string
+	for _, re := range res {
+		s += re.String()
+	}
+
+	return match(s)
+}
+
+func literal(s string) *regexp.Regexp {
+	re := match(regexp.QuoteMeta(s))
+
+	if _, complete := re.LiteralPrefix(); !complete {
+		panic("must be a literal")
+	}
+
+	return re
+}
+
+func optional(res ...*regexp.Regexp) *regexp.Regexp {
+	return match(group(expression(res...)).String() + `?`)
+}
+
+func group(res ...*regexp.Regexp) *regexp.Regexp {
+	return match(`(?:` + expression(res...).String() + `)`)
+}
+
+// Redefine ReferenceRegexp to not include capturing groups
+// as they are not allowed in mux.Router
+var ReferenceRegexp = expression(reference.NameRegexp,
+	optional(literal(":"), reference.TagRegexp),
+	optional(literal("@"), reference.DigestRegexp))
 
 // NewServer creates a new blob server
 func NewServer(cfg Config, resolver ResolverProvider) (*Server, error) {
@@ -104,7 +146,7 @@ func (reg *Server) Serve() error {
 	// path must be at least `/image-name:tag` (tag required)
 	// could also be like `/my-reg.com:8080/my/special_alpine:1.2.3/`
 	// or `/my-reg.com:8080/alpine:1.2.3/additional/path/will/be/ignored.json`
-	r.PathPrefix(`/{image:[a-zA-Z0-9_\/\-\.\:]+:[\w\.\-]+}`).MatcherFunc(isNoWebsocketRequest).HandlerFunc(reg.serve)
+	r.PathPrefix(`/{image:` + ReferenceRegexp.String() + `}`).MatcherFunc(isNoWebsocketRequest).HandlerFunc(reg.serve)
 	r.NewRoute().HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
 		log.WithField("path", req.URL.Path).Warn("unmapped request")
 		http.Error(resp, http.StatusText(http.StatusNotFound), http.StatusNotFound)
@@ -129,6 +171,19 @@ func (reg *Server) MustServe() {
 
 // serve serves a single file from an image
 func (reg *Server) serve(w http.ResponseWriter, req *http.Request) {
+	defer func() {
+		if err := recover(); err != nil {
+			path := ""
+			if req != nil && req.URL != nil {
+				path = req.URL.Path
+			}
+			log.
+				WithField("path", path).
+				Errorf("panic in blobserve request handling: %v\n%s", err, debug.Stack())
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+		}
+	}()
+
 	vars := mux.Vars(req)
 	image := vars["image"]
 	pref, err := reference.ParseNamed(image)
@@ -136,14 +191,16 @@ func (reg *Server) serve(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, fmt.Sprintf("cannot parse image '%q': %q", html.EscapeString(image), err), http.StatusNotFound)
 		return
 	}
-	repo := pref.Name()
-	var tag string
-	if refTagged, ok := pref.(reference.Tagged); ok {
-		tag = refTagged.Tag()
-	} else {
-		http.Error(w, fmt.Sprintf("cannot parse image '%q': tag is missing", html.EscapeString(image)), http.StatusNotFound)
+
+	_, hasTag := pref.(reference.Tagged)
+	_, hasDigest := pref.(reference.Digested)
+	if !hasTag && !hasDigest {
+		http.Error(w, fmt.Sprintf("cannot parse image '%q': tag or digest is missing", html.EscapeString(image)), http.StatusNotFound)
 		return
 	}
+
+	ref := pref.String()
+	repo := pref.Name()
 
 	var workdir string
 	var inlineReplacements []InlineReplacement
@@ -155,8 +212,6 @@ func (reg *Server) serve(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, fmt.Sprintf("forbidden repo: %q", html.EscapeString(repo)), http.StatusForbidden)
 		return
 	}
-
-	ref := fmt.Sprintf("%s:%s", repo, tag)
 
 	// The blobFor operation's context must be independent of this request. Even if we do not
 	// serve this request in time, we might want to serve another from the same ref in the future.
@@ -170,7 +225,7 @@ func (reg *Server) serve(w http.ResponseWriter, req *http.Request) {
 	}
 
 	log.WithField("path", req.URL.Path).Debug("handling blobserve")
-	pathPrefix := fmt.Sprintf("/%s:%s", repo, tag)
+	pathPrefix := fmt.Sprintf("/%s", ref)
 	if req.URL.Path == pathPrefix {
 		req.URL.Path += "/"
 	}

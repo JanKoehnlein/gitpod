@@ -54,6 +54,9 @@ export class ContextParser {
                 throw new Error(`Couldn't parse context '${contextURL}'.`);
             }
 
+            // TODO: Make the parsers return the context with normalizedContextURL set
+            result.normalizedContextURL = contextURL;
+
             if (prefixResult) {
                 result = await prefixResult.parser.handle(user, prefixResult.prefix, result);
             }

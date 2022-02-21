@@ -23,9 +23,6 @@ const (
 	// servicePrefixAnnotation is the annotation on the WS pod which contains the service prefix
 	servicePrefixAnnotation = "gitpod/servicePrefix"
 
-	// workspaceURLAnnotation is the annotation on the WS pod which contains the public workspace URL
-	workspaceURLAnnotation = "gitpod/url"
-
 	// workspaceNeverReadyAnnotation marks a workspace as having never been ready. It's the inverse of the former workspaceReadyAnnotation
 	workspaceNeverReadyAnnotation = "gitpod/never-ready"
 
@@ -49,10 +46,6 @@ const (
 	//   https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/#attaching-metadata-to-objects
 	workspaceInitializerAnnotation = "gitpod/contentInitializer"
 
-	// workspaceImageSpecAnnotation contains the protobuf serialized image spec in base64 encoding. We need to keep this around post-request
-	// to provide this information to the registry facade later in the workspace's lifecycle.
-	workspaceImageSpecAnnotation = "gitpod/imageSpec"
-
 	// workspaceFailedBeforeStoppingAnnotation marks a workspace as failed even before we tried
 	// to stop it. We do not extract the failure state from this annotation, but just stabilize
 	// the state computation.
@@ -68,12 +61,6 @@ const (
 	// fullWorkspaceBackupAnnotation is set on workspaces which operate using a full workspace backup
 	fullWorkspaceBackupAnnotation = "gitpod/fullWorkspaceBackup"
 
-	// ownerTokenAnnotation contains the owner token of the workspace
-	ownerTokenAnnotation = "gitpod/ownerToken"
-
-	// workspaceAdmissionAnnotation determines the user admission to a workspace, i.e. if it can be accessed by everyone without token
-	workspaceAdmissionAnnotation = "gitpod/admission"
-
 	// gitpodFinalizerName is the name of the Gitpod finalizer we use to clean up a workspace
 	gitpodFinalizerName = "gitpod.io/finalizer"
 
@@ -85,6 +72,9 @@ const (
 
 	// workspaceAnnotationPrefix prefixes pod annotations that contain annotations specified during the workspaces start request
 	workspaceAnnotationPrefix = "gitpod.io/annotation."
+
+	// stoppedByRequestAnnotation is set on a pod when it was requested to stop using a StopWorkspace call
+	stoppedByRequestAnnotation = "gitpod.io/stoppedByRequest"
 )
 
 // markWorkspaceAsReady adds annotations to a workspace pod
@@ -171,7 +161,11 @@ func (m *Manager) modifyFinalizer(ctx context.Context, workspaceID string, final
 
 		pod, err := m.findWorkspacePod(ctx, workspaceID)
 		if err != nil {
-			return xerrors.Errorf("cannot find workspace %s: %w", workspaceID, err)
+			if isKubernetesObjNotFoundError(err) {
+				return nil
+			}
+
+			return xerrors.Errorf("unexpected error searching workspace %s: %w", workspaceID, err)
 		}
 		if pod == nil {
 			return xerrors.Errorf("workspace %s does not exist", workspaceID)

@@ -14,19 +14,20 @@ import (
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
 	"github.com/gitpod-io/gitpod/content-service/api"
+	"github.com/gitpod-io/gitpod/content-service/api/config"
 	"github.com/gitpod-io/gitpod/content-service/pkg/storage"
 )
 
 // ContentService implements ContentServiceServer
 type ContentService struct {
-	cfg storage.Config
+	cfg config.StorageConfig
 	s   storage.PresignedAccess
 
 	api.UnimplementedContentServiceServer
 }
 
 // NewContentService create a new content service
-func NewContentService(cfg storage.Config) (res *ContentService, err error) {
+func NewContentService(cfg config.StorageConfig) (res *ContentService, err error) {
 	s, err := storage.NewPresignedAccess(&cfg)
 	if err != nil {
 		return nil, err
@@ -42,8 +43,9 @@ func (cs *ContentService) DeleteUserContent(ctx context.Context, req *api.Delete
 
 	bucket := cs.s.Bucket(req.OwnerId)
 	err = cs.s.DeleteBucket(ctx, bucket)
+	// TODO
 	if err == storage.ErrNotFound {
-		log.WithFields(log.OWI(req.OwnerId, "", "")).WithError(err).Error("DeleteUserContent: NotFound")
+		log.WithFields(log.OWI(req.OwnerId, "", "")).Debug("DeleteUserContent: NotFound")
 		return &api.DeleteUserContentResponse{}, nil
 	}
 	if err != nil {

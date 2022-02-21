@@ -14,9 +14,10 @@ import (
 
 	cli "github.com/urfave/cli/v2"
 	"golang.org/x/sys/unix"
+	"golang.org/x/xerrors"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
-	_ "github.com/gitpod-io/gitpod/ws-daemon/nsinsider/pkg/nsenter"
+	_ "github.com/gitpod-io/gitpod/common-go/nsenter"
 )
 
 func main() {
@@ -24,7 +25,7 @@ func main() {
 		Commands: []*cli.Command{
 			{
 				Name:  "move-mount",
-				Usage: "calls move_mount with fd 3 to target",
+				Usage: "calls move_mount with the pipe-fd to target",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
 						Name:     "target",
@@ -41,7 +42,7 @@ func main() {
 			},
 			{
 				Name:  "open-tree",
-				Usage: "opens a and writes the resulting mountfd to the Unix pipe on fd 3",
+				Usage: "opens a and writes the resulting mountfd to the Unix pipe on the pipe-fd",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
 						Name:     "target",
@@ -137,7 +138,7 @@ func main() {
 
 					out, err := cmd.CombinedOutput()
 					if err != nil {
-						return fmt.Errorf("fuse-overlayfs (%v) failed: %q\n%v",
+						return xerrors.Errorf("fuse-overlayfs (%v) failed: %q\n%v",
 							cmd.Args,
 							string(out),
 							err,
@@ -261,7 +262,7 @@ func main() {
 		},
 	}
 
-	log.Init("nsinsider", "", true, true)
+	log.Init("nsinsider", "", true, false)
 	err := app.Run(os.Args)
 	if err != nil {
 		log.WithField("instanceId", os.Getenv("GITPOD_INSTANCE_ID")).WithField("args", os.Args).Fatal(err)

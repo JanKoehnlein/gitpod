@@ -28,8 +28,6 @@ export interface User {
 
     identities: Identity[]
 
-    allowsMarketingCommunication: boolean;
-
     /**
      * Whether the user has been blocked to use our service, because of TOS violation for example.
      * Optional for backwards compatibility.
@@ -106,14 +104,22 @@ export interface AdditionalUserData {
     oauthClientsApproved?: { [key: string]: string }
     // to remember GH Orgs the user installed/updated the GH App for
     knownGitHubOrgs?: string[];
+
+    // Git clone URL pointing to the user's dotfile repo
+    dotfileRepo?: string;
 }
 
 export interface EmailNotificationSettings {
-    disallowTransactionalEmails?: boolean;
+    allowsChangelogMail?: boolean;
+    allowsDevXMail?: boolean;
+    allowsOnboardingMail?: boolean;
 }
 
 export type IDESettings = {
     defaultIde?: string
+    useDesktopIde?: boolean
+    defaultDesktopIde?: string
+    useLatestVersion?: boolean
 }
 
 export interface UserPlatform {
@@ -136,14 +142,6 @@ export interface UserPlatform {
 
 export interface UserFeatureSettings {
     /**
-     * This field is used as marker to grant users a free trial for using private repositories,
-     * independent of any subscription or Chargebee.
-     *  - it is set when the user uses their first private repo
-     *  - whether the trial is expired or not is juged by the UserService
-     */
-    privateRepoTrialStartDate?: string;
-
-    /**
      * Permanent feature flags are added to each and every workspace instance
      * this user starts.
      */
@@ -157,11 +155,22 @@ export interface UserFeatureSettings {
 export const WorkspaceFeatureFlags = { "full_workspace_backup": undefined, "fixed_resources": undefined };
 export type NamedWorkspaceFeatureFlag = keyof (typeof WorkspaceFeatureFlags);
 
-export interface UserEnvVarValue {
-    id?: string;
+export interface EnvVarWithValue {
     name: string;
-    repositoryPattern: string;
     value: string;
+}
+
+export interface ProjectEnvVarWithValue extends EnvVarWithValue {
+    id: string;
+    projectId: string;
+    censored: boolean;
+}
+
+export type ProjectEnvVar = Omit<ProjectEnvVarWithValue, 'value'>;
+
+export interface UserEnvVarValue extends EnvVarWithValue {
+    id?: string;
+    repositoryPattern: string; // DEPRECATED: Use ProjectEnvVar instead of repositoryPattern - https://github.com/gitpod-com/gitpod/issues/5322
 }
 export interface UserEnvVar extends UserEnvVarValue {
     id: string;
@@ -171,10 +180,12 @@ export interface UserEnvVar extends UserEnvVarValue {
 
 export namespace UserEnvVar {
 
+    // DEPRECATED: Use ProjectEnvVar instead of repositoryPattern - https://github.com/gitpod-com/gitpod/issues/5322
     export function normalizeRepoPattern(pattern: string) {
         return pattern.toLocaleLowerCase();
     }
 
+    // DEPRECATED: Use ProjectEnvVar instead of repositoryPattern - https://github.com/gitpod-com/gitpod/issues/5322
     export function score(value: UserEnvVarValue): number {
         // We use a score to enforce precedence:
         //      value/value = 0
@@ -197,6 +208,7 @@ export namespace UserEnvVar {
         return score;
     }
 
+    // DEPRECATED: Use ProjectEnvVar instead of repositoryPattern - https://github.com/gitpod-com/gitpod/issues/5322
     export function filter<T extends UserEnvVarValue>(vars: T[], owner: string, repo: string): T[] {
         let result = vars.filter(e => {
             const [ownerPattern, repoPattern] = splitRepositoryPattern(e.repositoryPattern);
@@ -244,10 +256,11 @@ export namespace UserEnvVar {
         return result;
     }
 
+    // DEPRECATED: Use ProjectEnvVar instead of repositoryPattern - https://github.com/gitpod-com/gitpod/issues/5322
     export function splitRepositoryPattern(repositoryPattern: string): string[] {
         const patterns = repositoryPattern.split('/');
-        const repoPattern = patterns.pop() || "";
-        const ownerPattern = patterns.join('/');
+        const repoPattern = patterns.slice(1).join('/')
+        const ownerPattern = patterns[0];
         return [ownerPattern, repoPattern];
     }
 }
@@ -378,10 +391,15 @@ export interface PendingGithubEvent {
 export interface Snapshot {
     id: string;
     creationTime: string;
+    availableTime?: string;
     originalWorkspaceId: string;
     bucketId: string;
     layoutData?: string;
+    state: SnapshotState;
+    message?: string;
 }
+
+export type SnapshotState = 'pending' | 'available' | 'error';
 
 export interface LayoutData {
     workspaceId: string;
@@ -559,6 +577,9 @@ export interface WorkspaceConfig {
     github?: GithubAppConfig;
     vscode?: VSCodeConfig;
 
+    /** deprecated. Enabled by default **/
+    experimentalNetwork?: boolean;
+
     /**
      * Where the config object originates from.
      *
@@ -586,7 +607,7 @@ export interface GithubAppPrebuildConfig {
     branches?: boolean
     pullRequests?: boolean
     pullRequestsFromForks?: boolean
-    addCheck?: boolean
+    addCheck?: boolean | 'prevent-merge-on-error'
     addBadge?: boolean
     addLabel?: boolean | string
     addComment?: boolean
@@ -682,6 +703,8 @@ export interface PortConfig {
     port: number;
     onOpen?: PortOnOpen;
     visibility?: PortVisibility;
+    description?: string;
+    name?: string;
 }
 export namespace PortConfig {
     export function is(config: any): config is PortConfig {
@@ -705,7 +728,7 @@ export interface TaskConfig {
     init?: string;
     prebuild?: string;
     command?: string;
-    env?: { [env: string]: string };
+    env?: { [env: string]: any };
     openIn?: 'bottom' | 'main' | 'left' | 'right';
     openMode?: 'split-top' | 'split-left' | 'split-right' | 'split-bottom' | 'tab-before' | 'tab-after';
 }
@@ -769,6 +792,7 @@ export namespace ExternalImageConfigFile {
 
 export interface WorkspaceContext {
     title: string;
+    /** This contains the URL portion of the contextURL (which might contain other modifiers as well). It's optional because it's not set for older workspaces. */
     normalizedContextURL?: string;
     forceCreateNewWorkspace?: boolean;
     forceImageBuild?: boolean;
@@ -791,15 +815,14 @@ export namespace WithSnapshot {
     }
 }
 
-export interface WithPrebuild {
-    snapshotBucketId: string;
+export interface WithPrebuild extends WithSnapshot {
     prebuildWorkspaceId: string;
     wasPrebuilt: true;
 }
 export namespace WithPrebuild {
     export function is(context: any): context is WithPrebuild {
         return context
-            && 'snapshotBucketId' in context
+            && WithSnapshot.is(context)
             && 'prebuildWorkspaceId' in context
             && 'wasPrebuilt' in context;
     }
@@ -868,8 +891,20 @@ export namespace PrebuiltWorkspaceContext {
     }
 }
 
+export interface WithReferrerContext extends WorkspaceContext {
+    referrer: string
+    referrerIde?: string
+}
+
+export namespace WithReferrerContext {
+    export function is(context: any): context is WithReferrerContext {
+        return context
+            && 'referrer' in context;
+    }
+}
+
 export interface WithEnvvarsContext extends WorkspaceContext {
-    envvars: UserEnvVarValue[];
+    envvars: EnvVarWithValue[];
 }
 
 export namespace WithEnvvarsContext {
@@ -1164,39 +1199,6 @@ export namespace AuthProviderEntry {
                 clientSecret: "redacted"
             }
         }
-    }
-}
-
-export interface Branding {
-    readonly name: string;
-    readonly favicon?: string;
-    /** Either including domain OR absolute path (interpreted relative to host URL) */
-    readonly logo: string;
-    readonly startupLogo: string;
-    readonly showProductivityTips: boolean;
-    readonly redirectUrlIfNotAuthenticated?: string;
-    readonly redirectUrlAfterLogout?: string;
-    readonly homepage: string;
-    readonly ide?: {
-        readonly logo: string;
-        readonly showReleaseNotes: boolean;
-        readonly helpMenu: Branding.Link[];
-    }
-    readonly links: {
-        readonly header: Branding.Link[];
-        readonly footer: Branding.Link[];
-        readonly social: Branding.SocialLink[];
-        readonly legal: Branding.Link[];
-    }
-}
-export namespace Branding {
-    export interface Link {
-        readonly name: string;
-        readonly url: string;
-    }
-    export interface SocialLink {
-        readonly type: string;
-        readonly url: string;
     }
 }
 

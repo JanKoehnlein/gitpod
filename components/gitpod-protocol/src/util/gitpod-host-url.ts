@@ -12,13 +12,13 @@ export interface UrlChange {
 }
 export type UrlUpdate = UrlChange | Partial<URL>;
 
-const basewoWkspaceIDRegex = "(([a-f][0-9a-f]{7}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})|([0-9a-z]{2,16}-[0-9a-z]{2,16}-[0-9a-z]{8}))";
+const baseWorkspaceIDRegex = "(([a-f][0-9a-f]{7}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})|([0-9a-z]{2,16}-[0-9a-z]{2,16}-[0-9a-z]{8,11}))";
 
 // this pattern matches v4 UUIDs as well as the new generated workspace ids (e.g. pink-panda-ns35kd21)
-const workspaceIDRegex = RegExp(`^${basewoWkspaceIDRegex}$`);
+const workspaceIDRegex = RegExp(`^${baseWorkspaceIDRegex}$`);
 
 // this pattern matches URL prefixes of workspaces
-const workspaceUrlPrefixRegex = RegExp(`^([0-9]{4,6}-)?${basewoWkspaceIDRegex}\\.`);
+const workspaceUrlPrefixRegex = RegExp(`^([0-9]{4,6}-)?${baseWorkspaceIDRegex}\\.`);
 
 export class GitpodHostUrl {
     readonly url: URL;
@@ -85,27 +85,27 @@ export class GitpodHostUrl {
     }
 
     asDashboard(): GitpodHostUrl {
-        return this.with(url => ({ pathname: '/workspaces/' }));
+        return this.with(url => ({ pathname: '/' }));
     }
 
     asLogin(): GitpodHostUrl {
-        return this.with(url => ({ pathname: '/login/' }));
+        return this.with(url => ({ pathname: '/login' }));
     }
 
     asUpgradeSubscription(): GitpodHostUrl {
-        return this.with(url => ({ pathname: '/plans/' }));
+        return this.with(url => ({ pathname: '/plans' }));
     }
 
     asAccessControl(): GitpodHostUrl {
-        return this.with(url => ({ pathname: '/access-control/' }));
+        return this.with(url => ({ pathname: '/integrations' }));
     }
 
     asSettings(): GitpodHostUrl {
-        return this.with(url => ({ pathname: '/settings/' }));
+        return this.with(url => ({ pathname: '/settings' }));
     }
 
-    asGraphQLApi(): GitpodHostUrl {
-        return this.with(url => ({ pathname: '/graphql/' }));
+    asPreferences(): GitpodHostUrl {
+        return this.with(url => ({ pathname: '/preferences' }));
     }
 
     asStart(workspaceId = this.workspaceId): GitpodHostUrl {
@@ -150,7 +150,7 @@ export class GitpodHostUrl {
         return undefined;
     }
 
-    get blobServe(): boolean {
+    get blobServe(): boolean {
         const hostSegments = this.url.host.split(".");
         if (hostSegments[0] === 'blobserve') {
             return true;

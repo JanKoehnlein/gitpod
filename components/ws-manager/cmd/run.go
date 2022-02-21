@@ -6,25 +6,17 @@ package cmd
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"io/ioutil"
 	"net"
-	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"github.com/bombsimon/logrusr"
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
-	"github.com/opentracing/opentracing-go"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/keepalive"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -33,7 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	grpc_gitpod "github.com/gitpod-io/gitpod/common-go/grpc"
+	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/pprof"
 	"github.com/gitpod-io/gitpod/content-service/pkg/layer"
@@ -54,6 +46,8 @@ var runCmd = &cobra.Command{
 		}
 		log.Info("wsman configuration is valid")
 
+		common_grpc.SetupLogging()
+
 		ctrl.SetLogger(logrusr.NewLogger(log.Log))
 
 		opts := ctrl.Options{
@@ -67,6 +61,10 @@ var runCmd = &cobra.Command{
 
 		if cfg.Prometheus.Addr != "" {
 			opts.MetricsBindAddress = cfg.Prometheus.Addr
+			err := metrics.Registry.Register(common_grpc.ClientMetrics())
+			if err != nil {
+				log.WithError(err).Error("Prometheus metrics incomplete")
+			}
 		}
 
 		mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), opts)
@@ -106,7 +104,7 @@ var runCmd = &cobra.Command{
 		defer mgmt.Close()
 
 		if cfg.Prometheus.Addr != "" {
-			err := mgmt.RegisterMetrics(metrics.Registry)
+			err = mgmt.RegisterMetrics(metrics.Registry)
 			if err != nil {
 				log.WithError(err).Error("Prometheus metrics incomplete")
 			}
@@ -115,59 +113,27 @@ var runCmd = &cobra.Command{
 		if len(cfg.RPCServer.RateLimits) > 0 {
 			log.WithField("ratelimits", cfg.RPCServer.RateLimits).Info("imposing rate limits on the gRPC interface")
 		}
-		ratelimits := grpc_gitpod.NewRatelimitingInterceptor(cfg.RPCServer.RateLimits)
+		ratelimits := common_grpc.NewRatelimitingInterceptor(cfg.RPCServer.RateLimits)
 
 		grpcMetrics := grpc_prometheus.NewServerMetrics()
 		grpcMetrics.EnableHandlingTimeHistogram()
 		metrics.Registry.MustRegister(grpcMetrics)
 
-		grpcOpts := []grpc.ServerOption{
-			// terminate the connection if the client pings more than once every 2 seconds
-			grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-				MinTime:             2 * time.Second,
-				PermitWithoutStream: true,
-			}),
-			// We don't know how good our cients are at closing connections. If they don't close them properly
-			// we'll be leaking goroutines left and right. Closing Idle connections should prevent that.
-			grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionIdle: 30 * time.Minute}),
-			grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
-				grpcMetrics.StreamServerInterceptor(),
-				grpc_opentracing.StreamServerInterceptor(grpc_opentracing.WithTracer(opentracing.GlobalTracer())),
-			)),
-			grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-				// add call metrics first to capture ratelimit errors
-				grpcMetrics.UnaryServerInterceptor(),
-				ratelimits.UnaryInterceptor(),
-				grpc_opentracing.UnaryServerInterceptor(grpc_opentracing.WithTracer(opentracing.GlobalTracer())),
-			)),
-		}
+		grpcOpts := common_grpc.ServerOptionsWithInterceptors(
+			[]grpc.StreamServerInterceptor{grpcMetrics.StreamServerInterceptor()},
+			[]grpc.UnaryServerInterceptor{grpcMetrics.UnaryServerInterceptor(), ratelimits.UnaryInterceptor()},
+		)
 		if cfg.RPCServer.TLS.CA != "" && cfg.RPCServer.TLS.Certificate != "" && cfg.RPCServer.TLS.PrivateKey != "" {
-			cert, err := tls.LoadX509KeyPair(cfg.RPCServer.TLS.Certificate, cfg.RPCServer.TLS.PrivateKey)
+			tlsConfig, err := common_grpc.ClientAuthTLSConfig(
+				cfg.RPCServer.TLS.CA, cfg.RPCServer.TLS.Certificate, cfg.RPCServer.TLS.PrivateKey,
+				common_grpc.WithSetClientCAs(true),
+				common_grpc.WithServerName("ws-manager"),
+			)
 			if err != nil {
-				log.WithError(err).WithField("crt", cfg.RPCServer.TLS.Certificate).WithField("key", cfg.RPCServer.TLS.PrivateKey).Fatal("could not load TLS keys")
-			}
-			certPool := x509.NewCertPool()
-			b, err := ioutil.ReadFile(cfg.RPCServer.TLS.CA)
-			if err != nil {
-				log.WithError(err).WithField("ca", cfg.RPCServer.TLS.CA).Fatal("could not load CA")
-			}
-			if !certPool.AppendCertsFromPEM(b) {
-				log.WithError(err).WithField("ca", cfg.RPCServer.TLS.CA).Fatal("failed to append CA")
+				log.WithError(err).Fatal("cannot load ws-manager certs")
 			}
 
-			creds := credentials.NewTLS(&tls.Config{
-				ClientAuth:   tls.RequireAndVerifyClientCert,
-				Certificates: []tls.Certificate{cert},
-				ClientCAs:    certPool,
-				ServerName:   "ws-manager",
-			})
-
-			grpcOpts = append(grpcOpts, grpc.Creds(creds))
-			log.
-				WithField("ca", cfg.RPCServer.TLS.CA).
-				WithField("crt", cfg.RPCServer.TLS.Certificate).
-				WithField("key", cfg.RPCServer.TLS.PrivateKey).
-				Debug("securing gRPC server with TLS")
+			grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(tlsConfig)))
 		} else {
 			log.Warn("no TLS configured - gRPC server will be unsecured")
 		}

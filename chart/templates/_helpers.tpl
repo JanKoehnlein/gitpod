@@ -172,10 +172,6 @@ env:
       fieldPath: metadata.namespace
 - name: KUBE_DOMAIN
   value: "{{ $gp.installation.kubedomain | default "svc.cluster.local" }}"
-{{- if not .noVersion }}
-- name: VERSION
-  value: "{{ $gp.version }}"
-{{- end }}
 - name: GITPOD_DOMAIN
   value: {{ $gp.hostname | quote }}
 - name: HOST_URL
@@ -187,7 +183,13 @@ env:
 - name: GITPOD_INSTALLATION_SHORTNAME
   value: {{ template "gitpod.installation.shortname" . }}
 - name: LOG_LEVEL
-  value: {{ $gp.log.level | default "debug" | lower | quote }}
+  value: {{ template "gitpod.loglevel" . }}
+{{- end -}}
+
+{{- define "gitpod.loglevel" -}}
+{{- $ := .root -}}
+{{- $gp := .gp -}}
+{{ $gp.log.level | default "info" | lower | quote }}
 {{- end -}}
 
 {{- define "gitpod.container.analyticsEnv" -}}
@@ -206,6 +208,8 @@ env:
 {{- $gp := .gp -}}
 - name: DB_HOST
   value: "{{ $gp.db.host }}"
+- name: DB_USERNAME
+  value: "{{ $gp.db.username }}"
 - name: DB_PORT
   value: "{{ $gp.db.port }}"
 - name: DB_PASSWORD
@@ -255,9 +259,9 @@ env:
 {{- $comp := .comp -}}
 {{- $tracing := $comp.tracing | default $gp.tracing -}}
 {{- if $tracing }}
-{{- if $tracing.endoint }}
+{{- if $tracing.endpoint }}
 - name: JAEGER_ENDPOINT
-  value: {{ $tracing.endoint }}
+  value: {{ $tracing.endpoint }}
 {{- else }}
 - name: JAEGER_AGENT_HOST
   valueFrom:
@@ -268,6 +272,9 @@ env:
   value: {{ $tracing.samplerType }}
 - name: JAEGER_SAMPLER_PARAM
   value: "{{ $tracing.samplerParam }}"
+{{- else }}
+- name: JAEGER_DISABLED
+  value: "true"
 {{- end }}
 {{- end -}}
 
@@ -304,6 +311,13 @@ registry.{{ .Values.hostname }}
 {{- $gp := .gp -}}
 {{- $comp := .comp -}}
 {{ template "gitpod.comp.imageRepo" . }}:{{- template "gitpod.comp.version" . -}}
+{{- end -}}
+
+{{- define "gitpod.comp.imageLatest" -}}
+{{- $ := .root -}}
+{{- $gp := .gp -}}
+{{- $comp := .comp -}}
+{{ template "gitpod.comp.imageRepo" . }}:latest
 {{- end -}}
 
 {{- define "gitpod.comp.configMap" -}}
@@ -355,7 +369,7 @@ storage:
 
 {{- define "gitpod.kube-rbac-proxy" -}}
 - name: kube-rbac-proxy
-  image: quay.io/brancz/kube-rbac-proxy:v0.9.0
+  image: quay.io/brancz/kube-rbac-proxy:v0.11.0
   args:
   - --v=10
   - --logtostderr

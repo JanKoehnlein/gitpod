@@ -4,8 +4,6 @@
 
 package kubernetes
 
-// wsman and ws-scheduler need to share labels/annotations so that we can have consistent logging and tracing.
-//
 // Those two are the only cases where you would actually need this package. If you think you need this elsewhere,
 // please make sure you're not better of using wsman's API to solve your problem. If this is actually what you need,
 // please update this comment.
@@ -49,7 +47,7 @@ const (
 	TraceIDAnnotation = "gitpod/traceid"
 
 	// CPULimitAnnotation enforces a strict CPU limit on a workspace by virtue of ws-daemon
-	CPULimitAnnotation = "gitpod/cpuLimit"
+	CPULimitAnnotation = "gitpod.io/cpuLimit"
 
 	// RequiredNodeServicesAnnotation lists all Gitpod services required on the node
 	RequiredNodeServicesAnnotation = "gitpod.io/requiredNodeServices"
@@ -57,6 +55,22 @@ const (
 	// ContainerIsGoneAnnotation is used as workaround for containerd https://github.com/containerd/containerd/pull/4214
 	// which might cause workspace container status propagation to fail, which in turn would keep a workspace running indefinitely.
 	ContainerIsGoneAnnotation = "gitpod.io/containerIsGone"
+
+	// WorkspaceURLAnnotation is the annotation on the WS pod which contains the public workspace URL.
+	WorkspaceURLAnnotation = "gitpod/url"
+
+	// OwnerTokenAnnotation contains the owner token of the workspace.
+	OwnerTokenAnnotation = "gitpod/ownerToken"
+
+	// WorkspaceAdmissionAnnotation determines the user admission to a workspace, i.e. if it can be accessed by everyone without token.
+	WorkspaceAdmissionAnnotation = "gitpod/admission"
+
+	// WorkspaceImageSpecAnnotation contains the protobuf serialized image spec in base64 encoding. We need to keep this around post-request
+	// to provide this information to the registry facade later in the workspace's lifecycle.
+	WorkspaceImageSpecAnnotation = "gitpod/imageSpec"
+
+	// WorkspaceExposedPorts contains the exposed ports in the workspace
+	WorkspaceExposedPorts = "gitpod/exposedPorts"
 )
 
 // WorkspaceSupervisorEndpoint produces the supervisor endpoint of a workspace.

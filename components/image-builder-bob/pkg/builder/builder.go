@@ -5,8 +5,8 @@
 package builder
 
 import (
+	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -17,12 +17,10 @@ import (
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 
-	"github.com/containerd/console"
+	"github.com/docker/cli/cli/config/configfile"
+	"github.com/docker/cli/cli/config/types"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/client/llb"
-	"github.com/moby/buildkit/session"
-	"github.com/moby/buildkit/util/progress/progressui"
-	"golang.org/x/sync/errgroup"
+	"golang.org/x/xerrors"
 )
 
 const (
@@ -79,157 +77,96 @@ func (b *Builder) buildBaseLayer(ctx context.Context, cl *client.Client) error {
 		return nil
 	}
 
-	log.Info("waiting for build context")
-	waitctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
-	defer cancel()
-	err := waitForBuildContext(waitctx)
-	if err != nil {
-		return err
-	}
-
 	log.Info("building base image")
-
-	var sess []session.Attachable
-	if baselayerAuth := b.Config.BaseLayerAuth; baselayerAuth != "" {
-		auth, err := newAuthProviderFromEnvvar(baselayerAuth)
-		if err != nil {
-			return fmt.Errorf("invalid base layer authentication: %w", err)
-		}
-		sess = append(sess, auth)
-	}
-
-	contextdir := b.Config.ContextDir
-	if contextdir == "" {
-		contextdir = "."
-	}
-	solveOpt := client.SolveOpt{
-		Frontend: "dockerfile.v0",
-		FrontendAttrs: map[string]string{
-			"filename": filepath.Base(b.Config.Dockerfile),
-		},
-		LocalDirs: map[string]string{
-			"context":    contextdir,
-			"dockerfile": filepath.Dir(b.Config.Dockerfile),
-		},
-		Session:      sess,
-		CacheImports: b.Config.LocalCacheImport(),
-	}
-
-	eg, ectx := errgroup.WithContext(ctx)
-	ch := make(chan *client.SolveStatus)
-	eg.Go(func() error {
-		_, err := cl.Solve(ectx, nil, solveOpt, ch)
-		if err != nil {
-			// buildkit errors are wrapped to contain the stack - that does not make for a pretty
-			// sight when printing it to the user.
-			if u := errors.Unwrap(err); u != nil {
-				return u
-			}
-
-			return err
-		}
-		return nil
-	})
-	eg.Go(func() error {
-		var c console.Console
-		return progressui.DisplaySolveStatus(ectx, "", c, os.Stdout, ch)
-	})
-	err = eg.Wait()
-	if err != nil {
-		return err
-	}
-
-	// First we built the base, now we push the image by building it again.
-	// We can't do this in one go because we cannot separate authentication for pull and push.
-	// However we want separate authentication for pulling the FROM of base image builds and pushing
-	// the built base images.
-	solveOpt.Exports = []client.ExportEntry{
-		{
-			Type: "image",
-			Attrs: map[string]string{
-				"name": b.Config.BaseRef,
-				"push": "true",
-			},
-		},
-	}
-	if lauth := b.Config.WorkspaceLayerAuth; lauth != "" {
-		auth, err := newAuthProviderFromEnvvar(lauth)
-		if err != nil {
-			return fmt.Errorf("invalid gp layer authentication: %w", err)
-		}
-		solveOpt.Session = []session.Attachable{auth}
-	}
-	eg, ectx = errgroup.WithContext(ctx)
-	ch = make(chan *client.SolveStatus)
-	eg.Go(func() error {
-		_, err := cl.Solve(ectx, nil, solveOpt, ch)
-		if err != nil {
-			// buildkit errors are wrapped to contain the stack - that does not make for a pretty
-			// sight when printing it to the user.
-			if u := errors.Unwrap(err); u != nil {
-				return u
-			}
-
-			return err
-		}
-		return nil
-	})
-	eg.Go(func() error {
-		var c console.Console
-		return progressui.DisplaySolveStatus(ectx, "", c, os.Stdout, ch)
-	})
-	err = eg.Wait()
-	if err != nil {
-		return err
-	}
-
-	log.Info("base image done")
-	return err
+	return buildImage(ctx, b.Config.ContextDir, b.Config.Dockerfile, b.Config.WorkspaceLayerAuth, b.Config.BaseRef)
 }
 
 func (b *Builder) buildWorkspaceImage(ctx context.Context, cl *client.Client) (err error) {
-	var sess []session.Attachable
-	if gplayerAuth := b.Config.WorkspaceLayerAuth; gplayerAuth != "" {
-		auth, err := newAuthProviderFromEnvvar(gplayerAuth)
-		if err != nil {
-			return err
-		}
-		sess = append(sess, auth)
-	}
+	log.Info("building workspace image")
 
-	def, err := llb.Image(b.Config.BaseRef).Marshal(context.Background())
+	contextDir, err := os.MkdirTemp("", "wsimg-*")
 	if err != nil {
 		return err
 	}
 
-	solveOpt := client.SolveOpt{
-		Exports: []client.ExportEntry{
-			{
-				Type: "image",
-				Attrs: map[string]string{
-					"name": b.Config.TargetRef,
-					"push": "true",
-				},
-			},
-		},
-		Session:      sess,
-		CacheImports: b.Config.LocalCacheImport(),
+	err = ioutil.WriteFile(filepath.Join(contextDir, "Dockerfile"), []byte(fmt.Sprintf("FROM %v", b.Config.BaseRef)), 0644)
+	if err != nil {
+		return xerrors.Errorf("unexpected error creating temporal directory: %w", err)
 	}
 
-	eg, ctx := errgroup.WithContext(ctx)
-	ch := make(chan *client.SolveStatus)
-	eg.Go(func() error {
-		_, err := cl.Solve(ctx, def, solveOpt, ch)
-		if err != nil {
-			return fmt.Errorf("cannot build Gitpod layer: %w", err)
+	return buildImage(ctx, contextDir, filepath.Join(contextDir, "Dockerfile"), b.Config.WorkspaceLayerAuth, b.Config.TargetRef)
+}
+
+func buildImage(ctx context.Context, contextDir, dockerfile, authLayer, target string) (err error) {
+	log.Info("waiting for build context")
+	waitctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+
+	err = waitForBuildContext(waitctx)
+	if err != nil {
+		return err
+	}
+
+	dockerConfig := "/tmp/config.json"
+	defer os.Remove(dockerConfig)
+
+	if authLayer != "" {
+		configFile := configfile.ConfigFile{
+			AuthConfigs: make(map[string]types.AuthConfig),
 		}
-		return nil
-	})
-	eg.Go(func() error {
-		var c console.Console
-		return progressui.DisplaySolveStatus(ctx, "", c, os.Stdout, ch)
-	})
-	return eg.Wait()
+
+		err := configFile.LoadFromReader(bytes.NewReader([]byte(fmt.Sprintf(`{"auths": %v }`, authLayer))))
+		if err != nil {
+			return xerrors.Errorf("unexpected error reading registry authentication: %w", err)
+		}
+
+		f, _ := os.OpenFile(dockerConfig, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+		defer f.Close()
+
+		err = configFile.SaveToWriter(f)
+		if err != nil {
+			return xerrors.Errorf("unexpected error writing registry authentication: %w", err)
+		}
+	}
+
+	contextdir := contextDir
+	if contextdir == "" {
+		contextdir = "."
+	}
+
+	buildctlArgs := []string{
+		// "--debug",
+		"build",
+		"--progress=plain",
+		"--output=type=image,name=" + target + ",push=true,oci-mediatypes=true",
+		//"--export-cache=type=inline",
+		"--local=context=" + contextdir,
+		//"--export-cache=type=registry,ref=" + target + "-cache",
+		//"--import-cache=type=registry,ref=" + target + "-cache",
+		"--frontend=dockerfile.v0",
+		"--local=dockerfile=" + filepath.Dir(dockerfile),
+		"--opt=filename=" + filepath.Base(dockerfile),
+	}
+
+	buildctlCmd := exec.Command("buildctl", buildctlArgs...)
+
+	buildctlCmd.Stderr = os.Stderr
+	buildctlCmd.Stdout = os.Stdout
+
+	env := os.Environ()
+	env = append(env, "DOCKER_CONFIG=/tmp")
+	buildctlCmd.Env = env
+
+	if err := buildctlCmd.Start(); err != nil {
+		return err
+	}
+
+	err = buildctlCmd.Wait()
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func waitForBuildContext(ctx context.Context) error {
@@ -262,46 +199,49 @@ func waitForBuildContext(ctx context.Context) error {
 func StartBuildkit(socketPath string) (cl *client.Client, teardown func() error, err error) {
 	stderr, err := ioutil.TempFile(os.TempDir(), "buildkitd_stderr")
 	if err != nil {
-		return nil, nil, fmt.Errorf("cannot create buildkitd log file: %w", err)
+		return nil, nil, xerrors.Errorf("cannot create buildkitd log file: %w", err)
 	}
 	stdout, err := ioutil.TempFile(os.TempDir(), "buildkitd_stdout")
 	if err != nil {
-		return nil, nil, fmt.Errorf("cannot create buildkitd log file: %w", err)
+		return nil, nil, xerrors.Errorf("cannot create buildkitd log file: %w", err)
 	}
 
-	cmd := exec.Command("buildkitd", "--addr="+socketPath, "--oci-worker-net=host", "--root=/workspace/buildkit")
+	cmd := exec.Command("buildkitd",
+		"--debug",
+		"--addr="+socketPath,
+		"--oci-worker-net=host", "--oci-worker-snapshotter=stargz",
+		"--root=/workspace/buildkit",
+	)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 0, Gid: 0}}
 	cmd.Stderr = stderr
 	cmd.Stdout = stdout
 	err = cmd.Start()
+	if err != nil {
+		return nil, nil, xerrors.Errorf("cannot start buildkitd: %w", err)
+	}
+	log.WithField("stderr", stderr.Name()).WithField("stdout", stdout.Name()).Debug("buildkitd started")
+
 	defer func() {
 		if err == nil {
 			return
 		}
 
 		if cmd.Process != nil {
-			cmd.Process.Kill()
+			_ = cmd.Process.Kill()
 		}
 
-		stderr.Seek(0, 0)
-		stdout.Seek(0, 0)
-		serr, _ := ioutil.ReadAll(stderr)
-		sout, _ := ioutil.ReadAll(stdout)
-		stderr.Close()
-		stdout.Close()
+		serr, _ := ioutil.ReadFile(stderr.Name())
+		sout, _ := ioutil.ReadFile(stdout.Name())
 
 		log.WithField("buildkitd-stderr", string(serr)).WithField("buildkitd-stdout", string(sout)).Error("buildkitd failure")
 	}()
-	if err != nil {
-		return nil, nil, fmt.Errorf("cannot start buildkitd: %w", err)
-	}
 
 	teardown = func() error {
-		err := cmd.Process.Kill()
 		stdout.Close()
 		stderr.Close()
-		return err
+		return cmd.Process.Kill()
 	}
+
 	cl, err = connectToBuildkitd(socketPath)
 	if err != nil {
 		return
@@ -341,5 +281,5 @@ func connectToBuildkitd(socketPath string) (cl *client.Client, err error) {
 		return
 	}
 
-	return nil, fmt.Errorf("cannot connect to buildkitd")
+	return nil, xerrors.Errorf("cannot connect to buildkitd")
 }

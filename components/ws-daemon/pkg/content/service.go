@@ -35,6 +35,7 @@ import (
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/container"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/internal/session"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/iws"
+	"github.com/gitpod-io/gitpod/ws-daemon/pkg/quota"
 )
 
 // WorkspaceService implements the InitService and WorkspaceService
@@ -65,8 +66,13 @@ func NewWorkspaceService(ctx context.Context, cfg Config, kubernetesNamespace st
 		return nil, xerrors.Errorf("cannot create working area: %w", err)
 	}
 
+	xfs, err := quota.NewXFS(cfg.WorkingArea)
+	if err != nil {
+		return nil, err
+	}
+
 	// read all session json files
-	store, err := session.NewStore(ctx, cfg.WorkingArea, workspaceLifecycleHooks(cfg, kubernetesNamespace, wec, uidmapper))
+	store, err := session.NewStore(ctx, cfg.WorkingArea, workspaceLifecycleHooks(cfg, kubernetesNamespace, wec, uidmapper, xfs))
 	if err != nil {
 		return nil, xerrors.Errorf("cannot create session store: %w", err)
 	}
@@ -142,7 +148,7 @@ func (s *WorkspaceService) InitWorkspace(ctx context.Context, req *api.InitWorks
 	owi := log.OWI(req.Metadata.Owner, req.Metadata.MetaId, req.Id)
 	tracing.ApplyOWI(span, owi)
 	log := log.WithFields(owi)
-	log.Info("InitWorkspace called")
+	log.Debug("InitWorkspace called")
 
 	var (
 		wsloc string
@@ -219,12 +225,17 @@ func (s *WorkspaceService) InitWorkspace(ctx context.Context, req *api.InitWorks
 				{ContainerID: 0, HostID: wsinit.GitpodUID, Size: 1},
 				{ContainerID: 1, HostID: 100000, Size: 65534},
 			},
+			OWI: OWI{
+				Owner:       req.Metadata.Owner,
+				WorkspaceID: req.Metadata.MetaId,
+				InstanceID:  req.Id,
+			},
 		}
 
 		err = RunInitializer(ctx, workspace.Location, req.Initializer, remoteContent, opts)
 		if err != nil {
 			log.WithError(err).WithField("workspaceId", req.Id).Error("cannot initialize workspace")
-			return nil, status.Error(codes.Internal, fmt.Sprintf("cannot initialize workspace: %s", err.Error()))
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
 		}
 	}
 
@@ -232,7 +243,7 @@ func (s *WorkspaceService) InitWorkspace(ctx context.Context, req *api.InitWorks
 	err = workspace.MarkInitDone(ctx)
 	if err != nil {
 		log.WithError(err).WithField("workspaceId", req.Id).Error("cannot initialize workspace")
-		return nil, status.Error(codes.Internal, fmt.Sprintf("cannot finish workspace init: %v", err))
+		return nil, status.Error(codes.FailedPrecondition, fmt.Sprintf("cannot finish workspace init: %v", err))
 	}
 
 	return &api.InitWorkspaceResponse{}, nil
@@ -251,10 +262,15 @@ func (s *WorkspaceService) creator(req *api.InitWorkspaceRequest) session.Worksp
 			ContentManifest:       req.ContentManifest,
 			RemoteStorageDisabled: req.RemoteStorageDisabled,
 
-			ServiceLocDaemon: filepath.Join(s.config.WorkingArea, req.Id+"-daemon"),
-			ServiceLocNode:   filepath.Join(s.config.WorkingAreaNode, req.Id+"-daemon"),
+			ServiceLocDaemon: filepath.Join(s.config.WorkingArea, ServiceDirName(req.Id)),
+			ServiceLocNode:   filepath.Join(s.config.WorkingAreaNode, ServiceDirName(req.Id)),
 		}, nil
 	}
+}
+
+// ServiceDirName produces the directory name for a workspace
+func ServiceDirName(instanceID string) string {
+	return instanceID + "-daemon"
 }
 
 // getCheckoutLocation returns the first checkout location found of any Git initializer configured by this request
@@ -311,11 +327,17 @@ func (s *WorkspaceService) DisposeWorkspace(ctx context.Context, req *api.Dispos
 		return resp, nil
 	}
 
-	// Ok, we have to do all the work
-	err = s.uploadWorkspaceLogs(ctx, sess)
-	if err != nil {
-		log.WithError(err).WithFields(sess.OWI()).Error("log backup failed")
-		// atm we do not fail the workspace here, yet, because we still might succeed with its content!
+	if req.BackupLogs {
+		if sess.RemoteStorageDisabled {
+			return nil, status.Errorf(codes.FailedPrecondition, "workspace has no remote storage")
+		}
+
+		// Ok, we have to do all the work
+		err = s.uploadWorkspaceLogs(ctx, sess)
+		if err != nil {
+			log.WithError(err).WithFields(sess.OWI()).Error("log backup failed")
+			// atm we do not fail the workspace here, yet, because we still might succeed with its content!
+		}
 	}
 
 	if req.Backup {
@@ -357,8 +379,7 @@ func (s *WorkspaceService) DisposeWorkspace(ctx context.Context, req *api.Dispos
 	}
 
 	// remove workspace daemon directory in the node
-	err = os.RemoveAll(sess.ServiceLocDaemon)
-	if err != nil {
+	if err := os.RemoveAll(sess.ServiceLocDaemon); err != nil {
 		log.WithError(err).WithField("workspaceId", req.Id).Error("cannot delete workspace daemon directory")
 	}
 
@@ -368,6 +389,11 @@ func (s *WorkspaceService) DisposeWorkspace(ctx context.Context, req *api.Dispos
 func (s *WorkspaceService) uploadWorkspaceContent(ctx context.Context, sess *session.Workspace, backupName, mfName string) (err error) {
 	//nolint:ineffassign
 	span, ctx := opentracing.StartSpanFromContext(ctx, "uploadWorkspaceContent")
+	span.SetTag("workspace", sess.WorkspaceID)
+	span.SetTag("instance", sess.InstanceID)
+	span.SetTag("backup", backupName)
+	span.SetTag("manifest", mfName)
+	span.SetTag("full", sess.FullWorkspaceBackup)
 	defer tracing.FinishSpan(span, &err)
 
 	var (
@@ -449,7 +475,7 @@ func (s *WorkspaceService) uploadWorkspaceContent(ctx context.Context, sess *ses
 			return
 		}
 		tmpfSize = stat.Size()
-		log.WithField("size", tmpfSize).WithFields(sess.OWI()).Debug("created temp file for workspace backup upload")
+		log.WithField("size", tmpfSize).WithField("location", tmpf.Name()).WithFields(sess.OWI()).Debug("created temp file for workspace backup upload")
 
 		return
 	})
@@ -680,14 +706,74 @@ func (s *WorkspaceService) TakeSnapshot(ctx context.Context, req *api.TakeSnapsh
 		snapshotName = rs.Qualify(backupName)
 	}
 
-	err = s.uploadWorkspaceContent(ctx, sess, backupName, mfName)
-	if err != nil {
-		log.WithError(err).WithField("workspaceId", req.Id).Error("snapshot upload failed")
-		return nil, status.Error(codes.Internal, "cannot upload snapshot")
+	if req.ReturnImmediately {
+		go func() {
+			ctx := context.Background()
+			err := s.uploadWorkspaceContent(ctx, sess, backupName, mfName)
+			if err != nil {
+				log.WithError(err).WithField("workspaceId", req.Id).Error("snapshot upload failed")
+			}
+		}()
+	} else {
+		err = s.uploadWorkspaceContent(ctx, sess, backupName, mfName)
+		if err != nil {
+			log.WithError(err).WithField("workspaceId", req.Id).Error("snapshot upload failed")
+			return nil, status.Error(codes.Internal, "cannot upload snapshot")
+		}
 	}
 
 	return &api.TakeSnapshotResponse{
 		Url: snapshotName,
+	}, nil
+}
+
+// BackupWorkspace creates a backup of a workspace, if possible
+func (s *WorkspaceService) BackupWorkspace(ctx context.Context, req *api.BackupWorkspaceRequest) (res *api.BackupWorkspaceResponse, err error) {
+	//nolint:ineffassign
+	span, ctx := opentracing.StartSpanFromContext(ctx, "BackupWorkspace")
+	span.SetTag("workspace", req.Id)
+	defer tracing.FinishSpan(span, &err)
+
+	sess := s.store.Get(req.Id)
+	if sess == nil {
+		// TODO(rl): do we want to fake a session just to see if we can access the location
+		// Potentiall fragile but we are probably using the backup in dire straits :shrug:
+		// i.e. location = /mnt/disks/ssd0/workspaces- + req.Id
+		// It would also need to setup the remote storagej
+		// ... but in the worse case we *could* backup locally and then upload manually
+		return nil, status.Error(codes.NotFound, "workspace does not exist")
+	}
+	if sess.RemoteStorageDisabled {
+		return nil, status.Errorf(codes.FailedPrecondition, "workspace has no remote storage")
+	}
+	rs, ok := sess.NonPersistentAttrs[session.AttrRemoteStorage].(storage.DirectAccess)
+	if rs == nil || !ok {
+		log.WithFields(sess.OWI()).WithError(err).Error("cannot take backup: no remote storage configured")
+		return nil, status.Error(codes.Internal, "workspace has no remote storage")
+	}
+
+	backupName := storage.DefaultBackup
+	var mfName = storage.DefaultBackupManifest
+	// TODO: do we want this always in the worse case?
+	if sess.FullWorkspaceBackup {
+		backupName = fmt.Sprintf(storage.FmtFullWorkspaceBackup, time.Now().UnixNano())
+	}
+	log.WithField("workspaceId", sess.WorkspaceID).WithField("instanceID", sess.InstanceID).WithField("backupName", backupName).Info("backing up")
+
+	err = s.uploadWorkspaceContent(ctx, sess, backupName, mfName)
+	if err != nil {
+		log.WithError(err).WithFields(sess.OWI()).Error("final backup failed")
+		return nil, status.Error(codes.DataLoss, "final backup failed")
+	}
+
+	var qualifiedName string
+	if sess.FullWorkspaceBackup {
+		qualifiedName = rs.Qualify(mfName)
+	} else {
+		qualifiedName = rs.Qualify(backupName)
+	}
+	return &api.BackupWorkspaceResponse{
+		Url: qualifiedName,
 	}, nil
 }
 
@@ -728,35 +814,4 @@ func (c *cannotCancelContext) Err() error {
 
 func (c *cannotCancelContext) Value(key interface{}) interface{} {
 	return c.Delegate.Value(key)
-}
-
-func workspaceLifecycleHooks(cfg Config, kubernetesNamespace string, workspaceExistenceCheck WorkspaceExistenceCheck, uidmapper *iws.Uidmapper) map[session.WorkspaceState][]session.WorkspaceLivecycleHook {
-	var setupWorkspace session.WorkspaceLivecycleHook = func(ctx context.Context, ws *session.Workspace) error {
-		if _, ok := ws.NonPersistentAttrs[session.AttrRemoteStorage]; !ws.RemoteStorageDisabled && !ok {
-			remoteStorage, err := storage.NewDirectAccess(&cfg.Storage)
-			if err != nil {
-				return xerrors.Errorf("cannot use configured storage: %w", err)
-			}
-
-			err = remoteStorage.Init(ctx, ws.Owner, ws.WorkspaceID, ws.InstanceID)
-			if err != nil {
-				return xerrors.Errorf("cannot use configured storage: %w", err)
-			}
-
-			err = remoteStorage.EnsureExists(ctx)
-			if err != nil {
-				return xerrors.Errorf("cannot use configured storage: %w", err)
-			}
-
-			ws.NonPersistentAttrs[session.AttrRemoteStorage] = remoteStorage
-		}
-
-		return nil
-	}
-
-	return map[session.WorkspaceState][]session.WorkspaceLivecycleHook{
-		session.WorkspaceInitializing: {setupWorkspace, iws.ServeWorkspace(uidmapper, api.FSShiftMethod(cfg.UserNamespaces.FSShift))},
-		session.WorkspaceReady:        {setupWorkspace},
-		session.WorkspaceDisposing:    {iws.StopServingWorkspace},
-	}
 }

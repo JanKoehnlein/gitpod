@@ -73,9 +73,6 @@ export class DBWorkspaceCluster implements WorkspaceCluster {
                     return JSON.stringify(value);
                 },
                 from(value: any): any {
-                    if (value === jsonifiedDefault) {
-                        return undefined;
-                    }
                     return JSON.parse(value);
                 }
             };

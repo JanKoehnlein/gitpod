@@ -17,11 +17,15 @@ import { TracingManager } from '@gitpod/gitpod-protocol/lib/util/tracing';
 import { PrometheusMetricsExporter } from './prometheus-metrics-exporter';
 import { BridgeController, WorkspaceManagerClientProviderConfigSource } from './bridge-controller';
 import { filePathTelepresenceAware } from '@gitpod/gitpod-protocol/lib/env';
-import { WorkspaceManagerClientProvider } from '@gitpod/ws-manager/lib/client-provider';
+import { WorkspaceManagerClientProvider, IWorkspaceManagerClientCallMetrics } from '@gitpod/ws-manager/lib/client-provider';
 import { WorkspaceManagerClientProviderCompositeSource, WorkspaceManagerClientProviderDBSource, WorkspaceManagerClientProviderSource } from '@gitpod/ws-manager/lib/client-provider-source';
 import { ClusterService, ClusterServiceServer } from './cluster-service-server';
 import { IAnalyticsWriter } from '@gitpod/gitpod-protocol/lib/analytics';
 import { newAnalyticsWriterFromEnv } from '@gitpod/gitpod-protocol/lib/util/analytics';
+import { MetaInstanceController } from './meta-instance-controller';
+import { IClientCallMetrics } from '@gitpod/content-service/lib/client-call-metrics';
+import { PrometheusClientCallMetrics } from "@gitpod/gitpod-protocol/lib/messaging/client-call-metrics";
+import { PreparingUpdateEmulator, PreparingUpdateEmulatorFactory } from './preparing-update-emulator';
 
 export const containerModule = new ContainerModule(bind => {
 
@@ -30,6 +34,12 @@ export const containerModule = new ContainerModule(bind => {
     bind(MessageBusIntegration).toSelf().inSingletonScope();
 
     bind(BridgeController).toSelf().inSingletonScope();
+
+    bind(MetaInstanceController).toSelf().inSingletonScope();
+
+    bind(PrometheusClientCallMetrics).toSelf().inSingletonScope();
+    bind(IClientCallMetrics).to(PrometheusClientCallMetrics).inSingletonScope();
+    bind(IWorkspaceManagerClientCallMetrics).toService(IClientCallMetrics);
 
     bind(WorkspaceManagerClientProvider).toSelf().inSingletonScope();
     bind(WorkspaceManagerClientProviderCompositeSource).toSelf().inSingletonScope();
@@ -59,4 +69,7 @@ export const containerModule = new ContainerModule(bind => {
     }).inSingletonScope();
 
     bind(IAnalyticsWriter).toDynamicValue(newAnalyticsWriterFromEnv).inSingletonScope();
+
+    bind(PreparingUpdateEmulator).toSelf().inRequestScope();
+    bind(PreparingUpdateEmulatorFactory).toAutoFactory(PreparingUpdateEmulator);
 });

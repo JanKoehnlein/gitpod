@@ -8,7 +8,6 @@ import { injectable, interfaces } from "inversify";
 import { HostContainerMapping } from "../../../src/auth/host-container-mapping";
 import { gitlabContainerModuleEE } from "../gitlab/container-module";
 import { bitbucketContainerModuleEE } from "../bitbucket/container-module";
-import { gitHubContainerModuleEE } from "../github/container-module";
 
 @injectable()
 export class HostContainerMappingEE extends HostContainerMapping {
@@ -21,8 +20,9 @@ export class HostContainerMappingEE extends HostContainerMapping {
             return (modules || []).concat([gitlabContainerModuleEE]);
         case "Bitbucket":
             return (modules || []).concat([bitbucketContainerModuleEE]);
-        case "GitHub":
-            return (modules || []).concat([gitHubContainerModuleEE]);
+        // case "BitbucketServer":
+            // FIXME
+            // return (modules || []).concat([bitbucketContainerModuleEE]);
         default:
             return modules;
         }

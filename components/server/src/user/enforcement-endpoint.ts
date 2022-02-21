@@ -7,9 +7,9 @@
 import * as express from 'express';
 import { injectable, inject } from "inversify";
 import { WorkspaceDB, UserDB } from '@gitpod/gitpod-db/lib';
-import { User, GitpodClient, GitpodServer } from '@gitpod/gitpod-protocol';
+import { User } from '@gitpod/gitpod-protocol';
 import { log, LogContext } from '@gitpod/gitpod-protocol/lib/util/logging';
-import { Env } from '../env';
+import { Config } from '../config';
 import { UserDeletionService } from '../user/user-deletion-service';
 import { AuthorizationService } from './authorization-service';
 import { Permission } from '@gitpod/gitpod-protocol/lib/permission';
@@ -17,13 +17,14 @@ import { ResponseError } from 'vscode-jsonrpc';
 import { ErrorCodes } from '@gitpod/gitpod-protocol/lib/messaging/error';
 import { GitpodServerImpl } from '../workspace/gitpod-server-impl';
 import { ResourceAccessGuard, OwnerResourceGuard } from '../auth/resource-access';
+import { ClientMetadata } from '../websocket/websocket-connection-manager';
 
 export const EnforcementControllerServerFactory = Symbol('EnforcementControllerServerFactory');
-export type EnforcementControllerServerFactory = () => GitpodServerImpl<GitpodClient, GitpodServer>;
+export type EnforcementControllerServerFactory = () => GitpodServerImpl;
 
 @injectable()
 export class EnforcementController {
-    @inject(Env) protected readonly env: Env;
+    @inject(Config) protected readonly config: Config;
     @inject(UserDB) protected readonly userDB: UserDB;
     @inject(WorkspaceDB) protected readonly workspaceDb: WorkspaceDB;
     @inject(UserDeletionService) protected readonly userDeletionService: UserDeletionService;
@@ -47,7 +48,7 @@ export class EnforcementController {
             another architecture is not necessary.
         */
         const server = this.serverFactory()
-        server.initialize(undefined, undefined, user, resourceAccessGuard);
+        server.initialize(undefined, user, resourceAccessGuard, ClientMetadata.from(user.id), undefined, {});
         return server;
     }
 
@@ -101,7 +102,7 @@ export class EnforcementController {
             const targetUserID = req.params.userid;
             const server = this.createGitpodServer(callingUser, resourceAccessGuard);
             try {
-                await server.adminBlockUser({ id: targetUserID, blocked: true });
+                await server.adminBlockUser({}, { id: targetUserID, blocked: true });
                 res.sendStatus(200);
             } catch (e) {
                 if (e instanceof ResponseError && e.code === ErrorCodes.NOT_FOUND) {
@@ -129,7 +130,7 @@ export class EnforcementController {
                 return;
             }
 
-            const actionUrl = this.env.hostUrl.withApi({ pathname: `/enforcement/kill-workspace/${req.params.wsid}` }).toString();
+            const actionUrl = this.config.hostUrl.withApi({ pathname: `/enforcement/kill-workspace/${req.params.wsid}` }).toString();
             res.send(`<html><body><h1>Click button below</h1><form method="post" action="${actionUrl}"><input type="submit" value="Do it"></form></body></html>`)
         });
         router.post("/kill-workspace/:wsid", async (req, res, next) => {
@@ -145,7 +146,7 @@ export class EnforcementController {
             const targetWsID = req.params.wsid;
             const server = this.createGitpodServer(callingUser, resourceAccessGuard);
             try {
-                await server.adminForceStopWorkspace(targetWsID);
+                await server.adminForceStopWorkspace({}, targetWsID);
 
                 const target = (await this.workspaceDb.findById(targetWsID))!;
                 const owner = await this.userDB.findUserById(target!.ownerId);
@@ -218,10 +219,10 @@ export class EnforcementController {
     }
 
     protected blockUserUrl(userId: string): string {
-        return this.env.hostUrl.withApi({ pathname: `/enforcement/block-user/${userId}` }).toString();
+        return this.config.hostUrl.withApi({ pathname: `/enforcement/block-user/${userId}` }).toString();
     }
 
     protected deleteUserUrl(userId: string): string {
-        return this.env.hostUrl.withApi({ pathname: `/enforcement/delete-user/${userId}` }).toString();
+        return this.config.hostUrl.withApi({ pathname: `/enforcement/delete-user/${userId}` }).toString();
     }
 }

@@ -215,7 +215,6 @@ func TestAnnotations(t *testing.T) {
 				t.Errorf("unexpected output (-want +got):\n%s", diff)
 			}
 		})
-
 	}
 }
 
@@ -312,4 +311,71 @@ func TestConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestWorkDirProvider(t *testing.T) {
+	mux := NewMux()
+	defer mux.Close()
+
+	terminalService := NewMuxTerminalService(mux)
+
+	type AssertWorkDirTest struct {
+		expectedWorkDir string
+		providedWorkDir string
+	}
+	assertWorkDir := func(arg *AssertWorkDirTest) {
+		term, err := terminalService.Open(context.Background(), &api.OpenTerminalRequest{
+			Workdir: arg.providedWorkDir,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diff := cmp.Diff(arg.expectedWorkDir, term.Terminal.CurrentWorkdir); diff != "" {
+			t.Errorf("unexpected output (-want +got):\n%s", diff)
+		}
+		_, err = terminalService.Shutdown(context.Background(), &api.ShutdownTerminalRequest{
+			Alias: term.Terminal.Alias,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	staticWorkDir, err := os.MkdirTemp("", "staticworkdir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(staticWorkDir)
+
+	terminalService.DefaultWorkdir = staticWorkDir
+	assertWorkDir(&AssertWorkDirTest{
+		expectedWorkDir: staticWorkDir,
+	})
+
+	dynamicWorkDir := ""
+	terminalService.DefaultWorkdirProvider = func() string {
+		return dynamicWorkDir
+	}
+	assertWorkDir(&AssertWorkDirTest{
+		expectedWorkDir: staticWorkDir,
+	})
+
+	dynamicWorkDir, err = os.MkdirTemp("", "dynamicworkdir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dynamicWorkDir)
+	assertWorkDir(&AssertWorkDirTest{
+		expectedWorkDir: dynamicWorkDir,
+	})
+
+	providedWorkDir, err := os.MkdirTemp("", "providedworkdir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(providedWorkDir)
+	assertWorkDir(&AssertWorkDirTest{
+		providedWorkDir: providedWorkDir,
+		expectedWorkDir: providedWorkDir,
+	})
 }

@@ -4,14 +4,14 @@
  * See License.enterprise.txt in the project root folder.
  */
 
-import { AccountingDB } from "../accounting-db";
+import { AccountingDB, TransactionalAccountingDBFactory } from "../accounting-db";
 import { DBAccountEntry } from "./entity/db-account-entry";
 import { User } from "@gitpod/gitpod-protocol";
 import { AccountEntry, Subscription, Credit, SubscriptionAndUser } from "@gitpod/gitpod-protocol/lib/accounting-protocol";
 import { EntityManager, Repository } from "typeorm";
-import { DBSubscription, DBSubscriptionAdditionalData, DBPaymentSourceInfo } from "./entity/db-subscription";
+import { DBSubscription, DBSubscriptionAdditionalData } from "./entity/db-subscription";
 import { injectable, inject } from "inversify";
-import * as uuidv4 from 'uuid/v4';
+import { v4 as uuidv4 } from 'uuid';
 import { DBUser } from "../typeorm/entity/db-user";
 import { TypeORM } from "./typeorm";
 
@@ -19,12 +19,19 @@ import { TypeORM } from "./typeorm";
 export class TypeORMAccountingDBImpl implements AccountingDB {
 
     @inject(TypeORM) typeORM: TypeORM;
+    @inject(TransactionalAccountingDBFactory) protected readonly transactionalFactory: TransactionalAccountingDBFactory;
 
-    async transaction<T>(code: (db: AccountingDB) => Promise<T>): Promise<T> {
+    async transaction<T>(closure: (db: AccountingDB) => Promise<T>, closures?: ((manager: EntityManager) => Promise<any>)[]): Promise<T> {
         const manager = await this.getEntityManager();
         return await manager.transaction(async manager => {
-            return await code(new TransactionalAccountingDBImpl(manager));
-        })
+            const transactionDB = this.transactionalFactory(manager);
+            const result = await closure(transactionDB);
+
+            for (const c of (closures || [])) {
+                await c(manager);
+            }
+            return result;
+        });
     }
 
     protected async getEntityManager() {
@@ -94,10 +101,6 @@ export class TypeORMAccountingDBImpl implements AccountingDB {
         return (await this.getEntityManager()).getRepository(DBSubscriptionAdditionalData);
     }
 
-    protected async getPaymentSourceRepo(): Promise<Repository<DBPaymentSourceInfo>> {
-        return (await this.getEntityManager()).getRepository(DBPaymentSourceInfo);
-    }
-
     async newSubscription(subscription: Omit<Subscription, 'uid'>): Promise<Subscription> {
         const newSubscription = new DBSubscription();
         Subscription.create(newSubscription);
@@ -116,16 +119,17 @@ export class TypeORMAccountingDBImpl implements AccountingDB {
 
     async findSubscriptionById(id: string): Promise<Subscription | undefined> {
         const repo = await this.getSubscriptionRepo();
-        return repo.findOneById(id);
+        return repo.findOne(id);
     }
 
     async deleteSubscription(subscription: Subscription): Promise<void> {
-        return await (await this.getSubscriptionRepo()).delete(subscription as DBSubscription);
+        await (await this.getSubscriptionRepo()).delete(subscription as DBSubscription);
     }
 
-    async findActiveSubscriptionByPlanID(planID: string): Promise<Subscription[]> {
+    async findActiveSubscriptionByPlanID(planID: string, date: string): Promise<Subscription[]> {
         return (await this.getSubscriptionRepo()).createQueryBuilder('subscription')
             .where('subscription.planID = :planID', { planID })
+            .andWhere('subscription.startDate <= :date AND (subscription.endDate = "" OR subscription.endDate > :date)', { date: date })
             .andWhere('subscription.deleted != true')
             .andWhere('subscription.planId != "free"')  // TODO DEL FREE-SUBS
             .getMany();
@@ -248,11 +252,6 @@ export class TypeORMAccountingDBImpl implements AccountingDB {
     async storeSubscriptionAdditionalData(subscriptionData: DBSubscriptionAdditionalData): Promise<DBSubscriptionAdditionalData> {
         const repo = await this.getSubscriptionAdditionalDataRepo();
         return repo.save(subscriptionData);
-    }
-
-    async storePaymentSourceInfo(info: DBPaymentSourceInfo): Promise<DBPaymentSourceInfo> {
-        const repo = await this.getPaymentSourceRepo();
-        return repo.save(info);
     }
 }
 

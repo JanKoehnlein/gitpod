@@ -6,13 +6,13 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
 
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/xerrors"
 )
 
 var (
@@ -38,7 +38,7 @@ func main() {
 	}
 
 	if useFacade {
-		err = createAndRunc(runcPath)
+		err = createAndRunc(runcPath, log)
 	} else {
 		err = syscall.Exec(runcPath, os.Args, os.Environ())
 	}
@@ -47,34 +47,48 @@ func main() {
 	}
 }
 
-func createAndRunc(runcPath string) error {
+func createAndRunc(runcPath string, log *logrus.Logger) error {
 	fc, err := os.ReadFile("config.json")
 	if err != nil {
-		return fmt.Errorf("cannot read config.json: %w", err)
+		return xerrors.Errorf("cannot read config.json: %w", err)
 	}
 
 	var cfg specs.Spec
 	err = json.Unmarshal(fc, &cfg)
 	if err != nil {
-		return fmt.Errorf("cannot decode config.json: %w", err)
+		return xerrors.Errorf("cannot decode config.json: %w", err)
 	}
 
 	cfg.Process.OOMScoreAdj = &defaultOOMScoreAdj
+	delete(cfg.Linux.Sysctl, "net.ipv4.ip_unprivileged_port_start")
+	// TODO(toru): Drop the `kernel.domainame`` setting as it currently fails in the rootless container.
+	// - https://github.com/opencontainers/runc/issues/2091
+	// - https://github.com/opencontainers/runtime-spec/issues/592
+	// Perhaps using OCI hooks can solve this problem, but it's a bit tricky and hard.
+	if _, ok := cfg.Linux.Sysctl["kernel.domainname"]; ok {
+		log.Warnln("Since the rootless container cannot use domainname yet, we ignored it.")
+		delete(cfg.Linux.Sysctl, "kernel.domainname")
+	}
+	cfg.Process.Capabilities.Ambient = append(cfg.Process.Capabilities.Ambient, "CAP_NET_BIND_SERVICE")
+	cfg.Process.Capabilities.Bounding = append(cfg.Process.Capabilities.Bounding, "CAP_NET_BIND_SERVICE")
+	cfg.Process.Capabilities.Effective = append(cfg.Process.Capabilities.Effective, "CAP_NET_BIND_SERVICE")
+	cfg.Process.Capabilities.Inheritable = append(cfg.Process.Capabilities.Inheritable, "CAP_NET_BIND_SERVICE")
+	cfg.Process.Capabilities.Permitted = append(cfg.Process.Capabilities.Permitted, "CAP_NET_BIND_SERVICE")
 
 	fc, err = json.Marshal(cfg)
 	if err != nil {
-		return fmt.Errorf("cannot encode config.json: %w", err)
+		return xerrors.Errorf("cannot encode config.json: %w", err)
 	}
 	for _, fn := range []string{"config.json", "/tmp/debug.json"} {
 		err = os.WriteFile(fn, fc, 0644)
 		if err != nil {
-			return fmt.Errorf("cannot encode config.json: %w", err)
+			return xerrors.Errorf("cannot encode config.json: %w", err)
 		}
 	}
 
 	err = syscall.Exec(runcPath, os.Args, os.Environ())
 	if err != nil {
-		return fmt.Errorf("exec %s: %w", runcPath, err)
+		return xerrors.Errorf("exec %s: %w", runcPath, err)
 	}
 	return nil
 }

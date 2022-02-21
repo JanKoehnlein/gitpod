@@ -17,19 +17,11 @@ metadata:
 data:
   config.json: |-
     {
+        "namespace": {{ .Release.Namespace | quote }},
         "ingress": {
             "httpAddress": ":{{- $comp.ports.httpProxy.containerPort -}}",
             "httpsAddress": ":{{- $comp.ports.httpsProxy.containerPort -}}",
             "header": "{{- $comp.hostHeader -}}"
-        },
-        "workspaceInfoProviderConfig": {
-            "wsManagerAddr": "ws-manager:8080",
-            "reconnectInterval": "3s",
-            "tls": {
-                "ca": "/ws-manager-client-tls-certs/ca.crt",
-                "crt": "/ws-manager-client-tls-certs/tls.crt",
-                "key": "/ws-manager-client-tls-certs/tls.key"
-            }
         },
         "proxy": {
             "https": {
@@ -53,8 +45,6 @@ data:
                 "workspaceHostSuffixRegex": {{ ($comp.workspaceHostSuffixRegex | default (printf "%s%s" "\\.ws[^\\.]*\\." ($.Values.hostname | replace "." "\\."))) | quote }}
             },
             "workspacePodConfig": {
-                "serviceTemplate": "http://ws-{{"{{ .workspaceID }}"}}-theia.{{- .Release.Namespace -}}.svc.cluster.local:{{"{{ .port }}"}}",
-                "portServiceTemplate": "http://ws-{{"{{ .workspaceID }}"}}-ports.{{- .Release.Namespace -}}.svc.cluster.local:{{"{{ .port }}"}}",
                 "theiaPort": {{ .Values.components.workspace.ports.http.containerPort }},
                 "supervisorPort": {{ .Values.components.workspace.ports.http.supervisorPort }},
                 "supervisorImage": "{{ template "gitpod.comp.imageFull" (dict "root" . "gp" $.Values "comp" .Values.components.workspace.supervisor) }}"
@@ -63,17 +53,16 @@ data:
                 "location": "/app/public"
             }
         },
-        {{ if (and $comp.wsManagerProxy $comp.wsManagerProxy.enabled) }}
-        "wsManagerProxy": {
-            "listenAddress": "{{ $comp.wsManagerProxy.listenAddress }}",
-            "rateLimiter": {
-                "refillInterval": "1s",
-                "bucketSize": {{ $comp.wsManagerProxy.ratelimit.maxRPS }}
-            }
-        },
-        {{ end }}
-        "pprofAddr": ":60060",
+        "pprofAddr": ":6060",
         "readinessProbeAddr": ":60088",
-        "prometheusAddr": ":60095"
+        "prometheusAddr": "localhost:9500",
+        "wsManager": {
+            "addr": "ws-manager:8080",
+            "tls": {
+                "ca": "/ws-manager-client-tls-certs/ca.crt",
+                "crt": "/ws-manager-client-tls-certs/tls.crt",
+                "key": "/ws-manager-client-tls-certs/tls.key"
+            }
+        }
     }
 {{- end -}}

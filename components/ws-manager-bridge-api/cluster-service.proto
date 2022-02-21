@@ -21,6 +21,10 @@ message RegisterRequest {
   TlsConfig tls = 3;
   RegistrationHints hints = 4;
   repeated AdmissionConstraint admission_constraints = 5;
+
+  // DEPRECATED
+  // repeated AdmissionPreference admission_preference = 6;
+  reserved 6;
 }
 
 message RegisterResponse {}
@@ -46,6 +50,8 @@ message AdmissionConstraint {
   oneof constraint {
     FeaturePreview has_feature_preview = 1;
     HasPermission has_permission = 2;
+    string has_user_level = 3;
+    bool has_more_resources = 4;
   }
 }
 
@@ -62,8 +68,12 @@ message ClusterStatus {
   int32 score = 4;
   int32 max_score = 5;
   bool governed = 6;
-  repeated AdmissionConstraint admission_constraints = 7;
+  repeated AdmissionConstraint admission_constraint = 7;
   bool static = 8;
+
+  // DEPRECATED
+  // repeated AdmissionPreference admission_preference = 9;
+  reserved 9;
 }
 
 enum ClusterState {
@@ -79,7 +89,10 @@ message UpdateRequest {
     int32 score = 2;
     int32 max_score = 3;
     bool cordoned = 4;
-    ModifyAdmissionConstraint admission_constraints = 5;
+    ModifyAdmissionConstraint admission_constraint = 5;
+
+    // DEPRECATED
+    // ModifyAdmissionPreference admission_preference = 6;
   }
 }
 
@@ -92,6 +105,7 @@ message UpdateResponse {}
 
 message DeregisterRequest {
   string name = 1;
+  bool force = 2;
 }
 
 message DeregisterResponse {}

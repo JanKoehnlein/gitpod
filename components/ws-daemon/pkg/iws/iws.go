@@ -5,6 +5,7 @@
 package iws
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -78,6 +79,10 @@ var (
 // ServeWorkspace establishes the IWS server for a workspace
 func ServeWorkspace(uidmapper *Uidmapper, fsshift api.FSShiftMethod) func(ctx context.Context, ws *session.Workspace) error {
 	return func(ctx context.Context, ws *session.Workspace) (err error) {
+		if _, running := ws.NonPersistentAttrs[session.AttrWorkspaceServer]; running {
+			return nil
+		}
+
 		//nolint:ineffassign
 		span, ctx := opentracing.StartSpanFromContext(ctx, "iws.ServeWorkspace")
 		defer tracing.FinishSpan(span, &err)
@@ -92,7 +97,7 @@ func ServeWorkspace(uidmapper *Uidmapper, fsshift api.FSShiftMethod) func(ctx co
 			return xerrors.Errorf("cannot start in-workspace-helper server: %w", err)
 		}
 
-		log.WithFields(ws.OWI()).Info("established IWS server")
+		log.WithFields(ws.OWI()).Debug("established IWS server")
 		ws.NonPersistentAttrs[session.AttrWorkspaceServer] = helper.Stop
 
 		return nil
@@ -116,7 +121,7 @@ func StopServingWorkspace(ctx context.Context, ws *session.Workspace) (err error
 	}
 
 	stopFn()
-	log.WithFields(ws.OWI()).Info("stopped IWS server")
+	log.WithFields(ws.OWI()).Debug("stopped IWS server")
 	return nil
 }
 
@@ -273,7 +278,6 @@ func (wbs *InWorkspaceServiceServer) PrepareForUserNS(ctx context.Context, req *
 		log.WithField("containerPID", containerPID).WithError(err).Error("cannot make container's rootfs shared")
 		return nil, status.Errorf(codes.Internal, "cannot make container's rootfs shared")
 	}
-	log.WithField("containerPID", containerPID).Info("mount shared")
 
 	err = nsinsider(wbs.Session.InstanceID, int(1), func(c *exec.Cmd) {
 		c.Args = append(c.Args, "mount-shiftfs-mark", "--source", rootfs, "--target", mountpoint)
@@ -300,7 +304,7 @@ func (wbs *InWorkspaceServiceServer) MountProc(ctx context.Context, req *api.Mou
 			return
 		}
 
-		log.WithError(err).WithField("procPID", procPID).WithField("reqPID", reqPID).Error("cannot mount proc")
+		log.WithError(err).WithField("procPID", procPID).WithField("reqPID", reqPID).WithFields(wbs.Session.OWI()).Error("cannot mount proc")
 		if _, ok := status.FromError(err); !ok {
 			err = status.Error(codes.Internal, "cannot mount proc")
 		}
@@ -331,7 +335,7 @@ func (wbs *InWorkspaceServiceServer) MountProc(ctx context.Context, req *api.Mou
 	}
 	err = nsinsider(wbs.Session.InstanceID, int(procPID), func(c *exec.Cmd) {
 		c.Args = append(c.Args, "mount-proc", "--target", nodeStaging)
-	}, enterMountNS(false), enterPidNS(true))
+	}, enterMountNS(false), enterPidNS(true), enterNetNS(true))
 	if err != nil {
 		return nil, xerrors.Errorf("mount new proc at %s: %w", nodeStaging, err)
 	}
@@ -353,6 +357,13 @@ func (wbs *InWorkspaceServiceServer) MountProc(ctx context.Context, req *api.Mou
 	if err != nil {
 		return nil, err
 	}
+
+	// now that we've moved the mount (which we've done with OPEN_TREE_CLONE), we'll
+	// need to unmount the mask mounts again to not leave them dangling.
+	var masks []string
+	masks = append(masks, procDefaultMaskedPaths...)
+	masks = append(masks, procDefaultReadonlyPaths...)
+	cleanupMaskedMount(wbs.Session.OWI(), nodeStaging, masks)
 
 	return &api.MountProcResponse{}, nil
 }
@@ -447,7 +458,7 @@ func (wbs *InWorkspaceServiceServer) UmountProc(ctx context.Context, req *api.Um
 			return
 		}
 		if len(msgs) != 1 {
-			fdrecv <- fdresp{Err: fmt.Errorf("expected a single socket control message")}
+			fdrecv <- fdresp{Err: xerrors.Errorf("expected a single socket control message")}
 			return
 		}
 
@@ -457,7 +468,7 @@ func (wbs *InWorkspaceServiceServer) UmountProc(ctx context.Context, req *api.Um
 			return
 		}
 		if len(fds) == 0 {
-			fdrecv <- fdresp{Err: fmt.Errorf("expected a single socket FD")}
+			fdrecv <- fdresp{Err: xerrors.Errorf("expected a single socket FD")}
 			return
 		}
 
@@ -519,9 +530,9 @@ func (wbs *InWorkspaceServiceServer) MountSysfs(ctx context.Context, req *api.Mo
 			return
 		}
 
-		log.WithError(err).WithField("procPID", procPID).WithField("reqPID", reqPID).Error("cannot mount proc")
+		log.WithError(err).WithField("procPID", procPID).WithField("reqPID", reqPID).WithFields(wbs.Session.OWI()).Error("cannot mount sysfs")
 		if _, ok := status.FromError(err); !ok {
-			err = status.Error(codes.Internal, "cannot mount proc")
+			err = status.Error(codes.Internal, "cannot mount sysfs")
 		}
 	}()
 
@@ -567,6 +578,8 @@ func (wbs *InWorkspaceServiceServer) MountSysfs(ctx context.Context, req *api.Mo
 		return nil, err
 	}
 
+	cleanupMaskedMount(wbs.Session.OWI(), nodeStaging, sysfsDefaultMaskedPaths)
+
 	return &api.MountProcResponse{}, nil
 }
 
@@ -578,14 +591,48 @@ func moveMount(instanceID string, targetPid int, source, target string) error {
 	mntf := os.NewFile(mntfd, "")
 	defer mntf.Close()
 
+	// Note(cw): we also need to enter the target PID namespace because the mount target
+	// 			 might refer to proc.
 	err = nsinsider(instanceID, targetPid, func(c *exec.Cmd) {
 		c.Args = append(c.Args, "move-mount", "--target", target, "--pipe-fd", "3")
 		c.ExtraFiles = append(c.ExtraFiles, mntf)
-	})
+	}, enterPidNS(true))
 	if err != nil {
 		return xerrors.Errorf("cannot move mount: %w", err)
 	}
 	return nil
+}
+
+// cleanupMaskedMount will unmount and remove the paths joined with the basedir.
+// Errors are logged instead of returned.
+// This is useful for when we've moved the mount (which we've done with OPEN_TREE_CLONE), we'll
+// need to unmount the mask mounts again to not leave them dangling.
+func cleanupMaskedMount(owi map[string]interface{}, base string, paths []string) {
+	for _, mask := range paths {
+		// Note: if errors happen while unmounting or removing the masks this does not mean
+		//       that the final unmount won't happen. I.e. we can ignore those errors here
+		//       because they would not be actionable anyways. Only if the final removal or
+		//       unmount fails did we leak a mount.
+
+		fn := filepath.Join(base, mask)
+		err := unix.Unmount(fn, 0)
+		if err != nil {
+			continue
+		}
+		_ = os.RemoveAll(fn)
+	}
+
+	err := unix.Unmount(base, 0)
+	if err != nil {
+		log.WithError(err).WithField("fn", base).WithFields(owi).Warn("cannot unmount dangling base mount")
+		return
+	}
+
+	err = os.RemoveAll(base)
+	if err != nil {
+		log.WithError(err).WithField("fn", base).WithFields(owi).Warn("cannot remove dangling base mount")
+		return
+	}
 }
 
 type nsinsiderOpts struct {
@@ -654,18 +701,21 @@ func nsinsider(instanceID string, targetPid int, mod func(*exec.Cmd), opts ...ns
 	for _, ns := range nss {
 		f, err := os.OpenFile(ns.Source, ns.Flags, 0)
 		if err != nil {
-			return fmt.Errorf("cannot open %s: %w", ns.Source, err)
+			return xerrors.Errorf("cannot open %s: %w", ns.Source, err)
 		}
 		defer f.Close()
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", ns.Env, stdioFdCount+len(cmd.ExtraFiles)))
 		cmd.ExtraFiles = append(cmd.ExtraFiles, f)
 	}
 
-	cmd.Stdout = os.Stdout
+	var cmdOut bytes.Buffer
+	cmd.Stdout = &cmdOut
 	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
 	err = cmd.Run()
+	log.FromBuffer(&cmdOut, log.WithFields(log.OWI("", "", instanceID)))
 	if err != nil {
-		return fmt.Errorf("cannot run nsinsider: %w", err)
+		return xerrors.Errorf("cannot run nsinsider: %w", err)
 	}
 	return nil
 }

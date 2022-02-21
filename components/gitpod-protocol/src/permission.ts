@@ -13,10 +13,10 @@ export const Permissions = {
     "registry-access": undefined,
     "admin-users": undefined,
     "admin-workspaces": undefined,
+    "admin-projects": undefined,
     "admin-api": undefined,
     "ide-settings": undefined,
     "new-workspace-cluster": undefined,
-    "teams-and-projects": undefined,
 };
 export type PermissionName = keyof (typeof Permissions);
 export const Roles = {"devops": undefined, "viewer": undefined, "admin": undefined };
@@ -35,6 +35,22 @@ export interface Role {
     permissions: PermissionName[],
 }
 
+export namespace RolesOrPermissions {
+    export function toPermissionSet(rolesOrPermissions: RoleOrPermission[] | undefined): Set<PermissionName> {
+        rolesOrPermissions = rolesOrPermissions || [];
+
+        const permissions = new Set<PermissionName>();
+        for (const rop of rolesOrPermissions) {
+            if (Permission.is(rop)) {
+                permissions.add(rop);
+            } else if (RoleName.is(rop)) {
+                Role.getByName(rop).permissions.forEach(p => permissions.add(p));
+            }
+        }
+        return permissions;
+    };
+}
+
 export namespace Permission {
     /** The permission to monitor the (live) state of a Gitpod installation */
     export const MONITOR: PermissionName = "monitor";
@@ -51,6 +67,9 @@ export namespace Permission {
     /** The permission for accessing all workspace data */
     export const ADMIN_WORKSPACES: PermissionName = "admin-workspaces";
 
+    /** The permission for accessing all projects data */
+    export const ADMIN_PROJECTS: PermissionName = "admin-projects";
+
     /** The permission to access the admin API */
     export const ADMIN_API: PermissionName = "admin-api";
 
@@ -63,9 +82,7 @@ export namespace Permission {
     }
 
     export const all = (): PermissionName[] => {
-        return Object.keys(Permission)
-            .map(k => (Permission as any)[k])
-            .filter(k => typeof(k) === 'string');
+        return Object.keys(Permissions) as PermissionName[];
     };
 }
 
@@ -95,6 +112,7 @@ export namespace Role {
         permissions: [
             Permission.ADMIN_USERS,
             Permission.ADMIN_WORKSPACES,
+            Permission.ADMIN_PROJECTS,
             Permission.ADMIN_API,
             Permission.ENFORCEMENT,
         ]

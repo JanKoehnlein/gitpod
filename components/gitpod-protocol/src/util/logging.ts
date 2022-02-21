@@ -30,66 +30,66 @@ export interface LogPayload {
 };
 
 export namespace log {
-    export function error(context: LogContext, message: string, error: Error, payload: LogPayload): void;
-    export function error(context: LogContext, message: string, error: Error): void;
+    export function error(context: LogContext, message: string, error: any, payload: LogPayload): void;
+    export function error(context: LogContext, message: string, error: any): void;
     export function error(context: LogContext, message: string, payload: LogPayload): void;
     export function error(context: LogContext, message: string): void;
-    export function error(context: LogContext, error: Error, payload: LogPayload): void;
-    export function error(context: LogContext, error: Error): void;
-    export function error(message: string, error: Error, payload: LogPayload): void;
-    export function error(message: string, error: Error): void;
+    export function error(context: LogContext, error: any, payload: LogPayload): void;
+    export function error(context: LogContext, error: any): void;
+    export function error(message: string, error: any, payload: LogPayload): void;
+    export function error(message: string, error: any): void;
     export function error(message: string, payload: LogPayload): void;
     export function error(message: string): void;
-    export function error(error: Error, payload: LogPayload): void;
-    export function error(error: Error): void;
+    export function error(error: any, payload: LogPayload): void;
+    export function error(error: any): void;
     export function error(...args: any[]): void {
         errorLog(false, args);
     }
 
-    export function warn(context: LogContext, message: string, error: Error, payload: LogPayload): void;
-    export function warn(context: LogContext, message: string, error: Error): void;
+    export function warn(context: LogContext, message: string, error: any, payload: LogPayload): void;
+    export function warn(context: LogContext, message: string, error: any): void;
     export function warn(context: LogContext, message: string, payload: LogPayload): void;
     export function warn(context: LogContext, message: string): void;
-    export function warn(context: LogContext, error: Error, payload: LogPayload): void;
-    export function warn(context: LogContext, error: Error): void;
-    export function warn(message: string, error: Error, payload: LogPayload): void;
-    export function warn(message: string, error: Error): void;
+    export function warn(context: LogContext, error: any, payload: LogPayload): void;
+    export function warn(context: LogContext, error: any): void;
+    export function warn(message: string, error: any, payload: LogPayload): void;
+    export function warn(message: string, error: any): void;
     export function warn(message: string, payload: LogPayload): void;
     export function warn(message: string): void;
-    export function warn(error: Error, payload: LogPayload): void;
-    export function warn(error: Error): void;
+    export function warn(error: any, payload: LogPayload): void;
+    export function warn(error: any): void;
     export function warn(...args: any[]): void {
         warnLog(false, args);
     }
 
-    export function info(context: LogContext, message: string, error: Error, payload: LogPayload): void;
-    export function info(context: LogContext, message: string, error: Error): void;
+    export function info(context: LogContext, message: string, error: any, payload: LogPayload): void;
+    export function info(context: LogContext, message: string, error: any): void;
     export function info(context: LogContext, message: string, payload: LogPayload): void;
     export function info(context: LogContext, message: string): void;
-    export function info(context: LogContext, error: Error, payload: LogPayload): void;
-    export function info(context: LogContext, error: Error): void;
-    export function info(message: string, error: Error, payload: LogPayload): void;
-    export function info(message: string, error: Error): void;
+    export function info(context: LogContext, error: any, payload: LogPayload): void;
+    export function info(context: LogContext, error: any): void;
+    export function info(message: string, error: any, payload: LogPayload): void;
+    export function info(message: string, error: any): void;
     export function info(message: string, payload: LogPayload): void;
     export function info(message: string): void;
-    export function info(error: Error, payload: LogPayload): void;
-    export function info(error: Error): void;
+    export function info(error: any, payload: LogPayload): void;
+    export function info(error: any): void;
     export function info(...args: any[]): void {
         infoLog(false, args);
     }
 
-    export function debug(context: LogContext, message: string, error: Error, payload: LogPayload): void;
-    export function debug(context: LogContext, message: string, error: Error): void;
+    export function debug(context: LogContext, message: string, error: any, payload: LogPayload): void;
+    export function debug(context: LogContext, message: string, error: any): void;
     export function debug(context: LogContext, message: string, payload: LogPayload): void;
     export function debug(context: LogContext, message: string): void;
-    export function debug(context: LogContext, error: Error, payload: LogPayload): void;
-    export function debug(context: LogContext, error: Error): void;
-    export function debug(message: string, error: Error, payload: LogPayload): void;
-    export function debug(message: string, error: Error): void;
+    export function debug(context: LogContext, error: any, payload: LogPayload): void;
+    export function debug(context: LogContext, error: any): void;
+    export function debug(message: string, error: any, payload: LogPayload): void;
+    export function debug(message: string, error: any): void;
     export function debug(message: string, payload: LogPayload): void;
     export function debug(message: string): void;
-    export function debug(error: Error, payload: LogPayload): void;
-    export function debug(error: Error): void;
+    export function debug(error: any, payload: LogPayload): void;
+    export function debug(error: any): void;
     export function debug(...args: any[]): void {
         debugLog(false, args);
     }
@@ -97,10 +97,14 @@ export namespace log {
     /**
      * Do not use in frontend.
      */
-    export function enableJSONLogging(componentArg: string, versionArg: string | undefined): void {
+    export function enableJSONLogging(componentArg: string, versionArg: string | undefined, logLevel?: LogrusLogLevel): void {
         component = componentArg;
         version = versionArg;
 
+        setLogLevel(logLevel);
+    }
+
+    export function setLogLevel(logLevel: LogrusLogLevel | undefined) {
         jsonLogging = true;
 
         console.error = function (...args: any[]): void {
@@ -115,8 +119,20 @@ export namespace log {
         console.debug = function (...args: any[]): void {
             debugLog(true, args);
         }
+
         console.log = console.info;
         // FIXME wrap also other console methods (e.g. trace())
+
+        // set/unset log functions based on loglevel so we only have to evaluate once, not every call
+        const noop = () => {};
+        const setLog = (logFunc: DoLogFunction, funcLevel: LogrusLogLevel): DoLogFunction => {
+            return LogrusLogLevel.isGreatherOrEqual(funcLevel, logLevel) ? logFunc : noop;
+        };
+
+        errorLog = setLog(doErrorLog, "error");
+        warnLog = setLog(doWarnLog, "warning");
+        infoLog = setLog(doInfoLog, "info");
+        debugLog = setLog(doDebugLog, "debug");
     }
 
     export function resetToDefaultLogging(): void {
@@ -128,22 +144,71 @@ export namespace log {
         console.info = infoConsoleLog;
         console.debug = debugConsoleLog;
     }
+
+    export function setVersion(versionArg: string) {
+        version = versionArg;
+    }
 }
 
-function errorLog(calledViaConsole: boolean, args: any[]): void {
+type DoLogFunction = (calledViaConsole: boolean, args: any[]) => void;
+
+let errorLog = doErrorLog;
+function doErrorLog(calledViaConsole: boolean, args: any[]): void {
     doLog(calledViaConsole, errorConsoleLog, 'ERROR', args);
 }
 
-function warnLog(calledViaConsole: boolean, args: any[]): void {
+let warnLog = doWarnLog;
+function doWarnLog(calledViaConsole: boolean, args: any[]): void {
     doLog(calledViaConsole, warnConsoleLog, 'WARNING', args);
 }
 
-function infoLog(calledViaConsole: boolean, args: any[]): void {
+let infoLog = doInfoLog;
+function doInfoLog(calledViaConsole: boolean, args: any[]): void {
     doLog(calledViaConsole, infoConsoleLog, 'INFO', args);
 }
 
-function debugLog(calledViaConsole: boolean, args: any[]): void {
+let debugLog = doDebugLog;
+function doDebugLog(calledViaConsole: boolean, args: any[]): void {
     doLog(calledViaConsole, debugConsoleLog, 'DEBUG', args);
+}
+
+// Ref: https://github.com/sirupsen/logrus#level-logging
+export type LogrusLogLevel = keyof (typeof LogrusLogLevels);
+export const LogrusLogLevels = {
+    trace: true,
+    debug: true,
+    info: true,
+    warning: true,
+    error: true,
+    fatal: true,
+    panic: true,
+}
+export namespace LogrusLogLevel {
+    export function isGreatherOrEqual(lvl: LogrusLogLevel | undefined, ref: LogrusLogLevel | undefined): boolean {
+        if (lvl === undefined) {
+            return false;
+        }
+        if (ref === undefined) {
+            return true;
+        }
+        return getLevelArity(lvl) >= getLevelArity(ref);
+    }
+    function getLevelArity(lvl: LogrusLogLevel): number {
+        return Object.keys(LogrusLogLevels)
+            .findIndex((l) => l === lvl);
+    }
+    export function getFromEnv(): LogrusLogLevel | undefined {
+        const lvlStr = process.env.LOG_LEVEL;
+        if (!lvlStr) {
+            return undefined;
+        }
+        const lvl = lvlStr as LogrusLogLevel;
+        const exists = LogrusLogLevels[lvl]
+        if (!exists) {
+            return undefined;
+        }
+        return lvl;
+    }
 }
 
 // Source: https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry#LogSeverity
@@ -243,7 +308,6 @@ function makeLogItem(severity: GoogleLogSeverity, context: LogContext | undefine
         severity,
         time: new Date().toISOString(),
         environment: process.env.KUBE_STAGE,
-        region: process.env.GITPOD_REGION,
         context,
         message,
         error,

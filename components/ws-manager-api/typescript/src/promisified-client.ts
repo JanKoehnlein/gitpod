@@ -11,6 +11,7 @@ import { TraceContext } from '@gitpod/gitpod-protocol/lib/util/tracing';
 import * as opentracing from 'opentracing';
 import * as grpc from "@grpc/grpc-js";
 import { Disposable } from "@gitpod/gitpod-protocol";
+import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
 
 export function withTracing(ctx: TraceContext) {
     const metadata = new grpc.Metadata();
@@ -46,7 +47,7 @@ async function linearBackoffRetry<Res>(run: (attempt: number) => Promise<Res>, a
                 throw err;
             }
 
-            console.debug(`ws-manager unavailable - retrying in ${delayMS}ms`);
+            log.warn(`ws-manager unavailable - retrying in ${delayMS}ms`, err);
             await new Promise((retry, _) => setTimeout(retry, delayMS));
         }
 
@@ -55,7 +56,7 @@ async function linearBackoffRetry<Res>(run: (attempt: number) => Promise<Res>, a
         }
     }
 
-    console.debug(`ws-manager unavailable - no more attempts left`);
+    log.error(`ws-manager unavailable - no more attempts left`);
     throw error;
 }
 
@@ -64,6 +65,7 @@ export class PromisifiedWorkspaceManagerClient implements Disposable {
     constructor(
         public readonly client: WorkspaceManagerClient,
         protected readonly retryIfUnavailable: RetryStrategy = noRetry,
+        protected readonly interceptor: grpc.Interceptor[],
         protected readonly stopSignal?: { stop: boolean }) { }
 
     public startWorkspace(ctx: TraceContext, request: StartWorkspaceRequest): Promise<StartWorkspaceResponse> {
@@ -180,7 +182,7 @@ export class PromisifiedWorkspaceManagerClient implements Disposable {
         return this.retryIfUnavailable((attempt: number) => new Promise<TakeSnapshotResponse>((resolve, reject) => {
             const span = TraceContext.startSpan(`/ws-manager/takeSnapshot`, ctx);
             span.log({attempt});
-            this.client.takeSnapshot(request, withTracing({span}), (err, resp) => {
+            this.client.takeSnapshot(request, withTracing({span}), this.getDefaultUnaryOptions(), (err, resp) => {
                 span.finish();
                 if (err) {
                     reject(err);
@@ -196,7 +198,7 @@ export class PromisifiedWorkspaceManagerClient implements Disposable {
         return this.retryIfUnavailable((attempt: number) => new Promise<ControlAdmissionResponse>((resolve, reject) => {
             const span = TraceContext.startSpan(`/ws-manager/controlAdmission`, ctx);
             span.log({attempt});
-            this.client.controlAdmission(request, withTracing({span}), (err, resp) => {
+            this.client.controlAdmission(request, withTracing({span}), this.getDefaultUnaryOptions(), (err, resp) => {
                 span.finish();
                 if (err) {
                     reject(err);
@@ -219,11 +221,10 @@ export class PromisifiedWorkspaceManagerClient implements Disposable {
     }
 
     protected getDefaultUnaryOptions(): Partial<grpc.CallOptions> {
-        /* the node grpc client does not support dial timeouts, hence we need to time out the operation as a whole.
-         */
-        let deadline = new Date(new Date().getTime() + 10000);
+        let deadline = new Date(new Date().getTime() + 30000);
         return {
-            deadline
+            deadline,
+            interceptors: this.interceptor,
         }
     }
 

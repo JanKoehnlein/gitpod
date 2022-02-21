@@ -15,6 +15,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gitpod-io/gitpod/agent-smith/pkg/common"
+	"github.com/gitpod-io/gitpod/agent-smith/pkg/config"
+
 	slack "github.com/ashwanthkumar/slack-go-webhook"
 	"github.com/gitpod-io/gitpod/agent-smith/pkg/agent"
 	"github.com/gitpod-io/gitpod/common-go/log"
@@ -22,6 +25,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
+	"golang.org/x/xerrors"
 )
 
 // runCmd represents the run command
@@ -29,7 +33,7 @@ var runCmd = &cobra.Command{
 	Use:   "run",
 	Short: "Starts agent smith",
 	Run: func(cmd *cobra.Command, args []string) {
-		cfg, err := getConfig()
+		cfg, err := config.GetConfig(cfgFile)
 		if err != nil {
 			log.WithError(err).Fatal("cannot get config")
 		}
@@ -57,7 +61,7 @@ var runCmd = &cobra.Command{
 			log.WithError(err).Fatal("cannot create agent smith")
 		}
 
-		err = smith.RegisterMetrics(reg)
+		err = reg.Register(smith)
 		if err != nil {
 			log.WithError(err).Fatal("cannot register metrics")
 		}
@@ -66,7 +70,7 @@ var runCmd = &cobra.Command{
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		go smith.Start(ctx, func(violation agent.InfringingWorkspace, penalties []agent.PenaltyKind) {
+		go smith.Start(ctx, func(violation agent.InfringingWorkspace, penalties []config.PenaltyKind) {
 			log.WithField("violation", violation).WithField("penalties", penalties).Info("Found violation")
 
 			if cfg.SlackWebhooks != nil {
@@ -74,10 +78,10 @@ var runCmd = &cobra.Command{
 					// Need to set err to nil to eliminate the chance of logging previous errors after the loop.
 					err = nil
 
-					if i.Kind.Severity() == agent.InfringementSeverityAudit {
+					if i.Kind.Severity() == common.SeverityAudit {
 						err = notifySlack(cfg.SlackWebhooks.Audit, cfg.HostURL, violation, penalties)
 						break
-					} else if i.Kind.Severity() != agent.InfringementSeverityBarely {
+					} else if i.Kind.Severity() != common.SeverityBarely {
 						err = notifySlack(cfg.SlackWebhooks.Warning, cfg.HostURL, violation, penalties)
 						break
 					}
@@ -128,12 +132,13 @@ func startMemoryWatchdog(maxSysMemMib uint64) {
 	}
 }
 
-func notifySlack(webhook string, hostURL string, ws agent.InfringingWorkspace, penalties []agent.PenaltyKind) error {
+func notifySlack(webhook string, hostURL string, ws agent.InfringingWorkspace, penalties []config.PenaltyKind) error {
 	var (
-		region       = os.Getenv("GITPOD_REGION")
-		lblDetails   = "Details"
-		lblActions   = "Actions"
-		lblPenalties = "Penalties"
+		region           = os.Getenv("GITPOD_REGION")
+		lblDetails       = "Details"
+		lblActions       = "Actions"
+		lblPenalties     = "Penalties"
+		lblInfringements = "Long Infringements details"
 	)
 
 	attachments := []slack.Attachment{
@@ -170,8 +175,19 @@ func notifySlack(webhook string, hostURL string, ws agent.InfringingWorkspace, p
 		},
 	)
 
+	infringements := make([]*slack.Field, len(ws.Infringements))
+	for _, v := range ws.Infringements {
+		infringements = append(infringements, &slack.Field{
+			Title: string(v.Kind), Value: v.Description,
+		})
+	}
+
+	attachments = append(attachments,
+		slack.Attachment{Title: &lblInfringements, Fields: infringements},
+	)
+
 	payload := slack.Payload{
-		Text:        fmt.Sprintf("Agent Smith: %s", ws.DescibeInfringements()),
+		Text:        fmt.Sprintf("Agent Smith: %s", ws.DescribeInfringements(150)),
 		IconEmoji:   ":-(",
 		Attachments: attachments,
 	}
@@ -182,7 +198,7 @@ func notifySlack(webhook string, hostURL string, ws agent.InfringingWorkspace, p
 		for i, err := range errs {
 			allerr[i] = err.Error()
 		}
-		return fmt.Errorf("notifySlack: %s", strings.Join(allerr, ", "))
+		return xerrors.Errorf("notifySlack: %s", strings.Join(allerr, ", "))
 	}
 
 	return nil

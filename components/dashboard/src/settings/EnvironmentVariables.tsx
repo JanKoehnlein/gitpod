@@ -59,7 +59,7 @@ function AddEnvVarModal(p: EnvVarModalProps) {
             </div> : null}
             <div>
                 <h4>Name</h4>
-                <input className="w-full" type="text" value={ev.name} onChange={(v) => { update({name: v.target.value}) }} />
+                <input autoFocus className="w-full" type="text" value={ev.name} onChange={(v) => { update({name: v.target.value}) }} />
             </div>
             <div className="mt-4">
                 <h4>Value</h4>
@@ -67,7 +67,7 @@ function AddEnvVarModal(p: EnvVarModalProps) {
             </div>
             <div className="mt-4">
                 <h4>Scope</h4>
-                <input className="w-full" type="text" value={ev.repositoryPattern} placeholder="e.g. org/project"
+                <input className="w-full" type="text" value={ev.repositoryPattern} placeholder="e.g. owner/repository"
                     onChange={(v) => { update({repositoryPattern: v.target.value}) }} />
             </div>
             <div className="mt-1">
@@ -181,8 +181,6 @@ export default function EnvVars() {
         return '';
     };
 
-
-
     return <PageWithSubMenu subMenu={settingsMenu} title='Variables' subtitle='Configure environment variables for all workspaces.'>
         {isAddEnvVarModalVisible && <AddEnvVarModal
             save={save}
@@ -208,20 +206,19 @@ export default function EnvVars() {
             ? <div className="bg-gray-100 dark:bg-gray-800 rounded-xl w-full h-96">
                 <div className="pt-28 flex flex-col items-center w-96 m-auto">
                     <h3 className="text-center pb-3 text-gray-500 dark:text-gray-400">No Environment Variables</h3>
-                    <div className="text-center pb-6 text-gray-500">In addition to user-specific environment variables you can also pass variables through a workspace creation URL. <a className="text-gray-400 learn-more hover:text-gray-600" href="https://www.gitpod.io/docs/environment-variables/#using-the-account-settings">Learn more</a></div>
+                    <div className="text-center pb-6 text-gray-500">In addition to user-specific environment variables you can also pass variables through a workspace creation URL. <a className="gp-link" href="https://www.gitpod.io/docs/environment-variables/#using-the-account-settings">Learn more</a></div>
                     <button onClick={add}>New Variable</button>
                 </div>
             </div>
             : <ItemsList>
                 <Item header={true}>
-                    <ItemField className="w-5/12">Name</ItemField>
-                    <ItemField className="w-5/12">Scope</ItemField>
-                    <ItemFieldContextMenu />
+                    <ItemField className="w-5/12 my-auto">Name</ItemField>
+                    <ItemField className="w-5/12 my-auto">Scope</ItemField>
                 </Item>
                 {envVars.map(variable => {
                     return <Item className="whitespace-nowrap">
-                        <ItemField className="w-5/12 overflow-ellipsis truncate">{variable.name}</ItemField>
-                        <ItemField className="w-5/12 overflow-ellipsis truncate text-sm text-gray-400">{variable.repositoryPattern}</ItemField>
+                        <ItemField className="w-5/12 overflow-ellipsis truncate my-auto">{variable.name}</ItemField>
+                        <ItemField className="w-5/12 overflow-ellipsis truncate text-sm text-gray-400 my-auto">{variable.repositoryPattern}</ItemField>
                         <ItemFieldContextMenu menuEntries={[
                             {
                                 title: 'Edit',

@@ -4,9 +4,9 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-import { User, TeamMemberInfo } from "@gitpod/gitpod-protocol";
+import { User, TeamMemberInfo, Project } from "@gitpod/gitpod-protocol";
 import { useContext, useEffect, useState } from "react";
-import { Link, useHistory } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { useLocation, useRouteMatch } from "react-router";
 import { Location } from "history";
 import gitpodIcon from './icons/gitpod.svg';
@@ -21,6 +21,9 @@ import ContextMenu from "./components/ContextMenu";
 import Separator from "./components/Separator";
 import PillMenuItem from "./components/PillMenuItem";
 import TabMenuItem from "./components/TabMenuItem";
+import { getTeamSettingsMenu } from "./teams/TeamSettings";
+import { getProjectSettingsMenu } from "./projects/ProjectSettings";
+import { ProjectContext } from "./projects/project-context";
 
 interface Entry {
     title: string,
@@ -28,23 +31,23 @@ interface Entry {
     alternatives?: string[]
 }
 
-
 export default function Menu() {
     const { user } = useContext(UserContext);
     const { teams } = useContext(TeamsContext);
-    const history = useHistory();
     const location = useLocation();
+    const team = getCurrentTeam(location, teams);
+    const { project, setProject } = useContext(ProjectContext);
 
-    const match = useRouteMatch<{ segment1?: string, segment2?: string, segment3?: string }>("/:segment1/:segment2?/:segment3?");
-    const projectName = (() => {
+    const match = useRouteMatch<{ segment1?: string, segment2?: string, segment3?: string }>("/(t/)?:segment1/:segment2?/:segment3?");
+    const projectSlug = (() => {
         const resource = match?.params?.segment2;
-        if (resource && !["projects", "members", "users", "workspaces"].includes(resource)) {
+        if (resource && !["projects", "members", "users", "workspaces", "settings"].includes(resource)) {
             return resource;
         }
     })();
     const prebuildId = (() => {
-        const resource = projectName && match?.params?.segment3;
-        if (resource !== "prebuilds" && resource !== "settings" && resource !== "configure") {
+        const resource = projectSlug && match?.params?.segment3;
+        if (resource !== "workspaces" && resource !== "prebuilds" && resource !== "settings" && resource !== "configure" && resource !== "variables") {
             return resource;
         }
     })();
@@ -56,70 +59,109 @@ export default function Menu() {
     }
 
     const userFullName = user?.fullName || user?.name || '...';
-    const showTeamsUI = user?.rolesOrPermissions?.includes('teams-and-projects');
-    const team = getCurrentTeam(location, teams);
+
+    {
+        // updating last team selection
+        try {
+            localStorage.setItem('team-selection', team ? team.slug : "");
+        } catch {
+        }
+    }
 
     // Hide most of the top menu when in a full-page form.
-    const isMinimalUI = ['/new', '/teams/new'].includes(location.pathname);
+    const isMinimalUI = ['/new', '/teams/new', '/open'].includes(location.pathname);
 
     const [ teamMembers, setTeamMembers ] = useState<Record<string, TeamMemberInfo[]>>({});
     useEffect(() => {
-        if (!showTeamsUI || !teams) {
+        if (!teams) {
             return;
         }
         (async () => {
             const members: Record<string, TeamMemberInfo[]> = {};
             await Promise.all(teams.map(async (team) => {
-                const infos = await getGitpodService().server.getTeamMembers(team.id);
-                members[team.id] = infos;
+                try {
+                    members[team.id] = await getGitpodService().server.getTeamMembers(team.id);
+                } catch (error) {
+                    console.error('Could not get members of team', team, error);
+                }
             }));
             setTeamMembers(members);
         })();
     }, [ teams ]);
 
-    const teamOrUserSlug = !!team ? team.slug : 'projects';
+    useEffect(() => {
+        if (!teams || !projectSlug) {
+            return;
+        }
+        (async () => {
+            const projects = (!!team
+                ? await getGitpodService().server.getTeamProjects(team.id)
+                : await getGitpodService().server.getUserProjects());
+
+            // Find project matching with slug, otherwise with name
+            const project = projectSlug && projects.find(p => p.slug ? p.slug === projectSlug : p.name === projectSlug);
+            if (!project) {
+                return;
+            }
+            setProject(project);
+        })();
+    }, [projectSlug, setProject, team, teams]);
+
+    const teamOrUserSlug = !!team ? '/t/' + team.slug : '/projects';
     const leftMenu: Entry[] = (() => {
         // Project menu
-        if (projectName) {
+        if (projectSlug) {
             return [
                 {
-                    title: 'Overview',
-                    link: `/${teamOrUserSlug}/${projectName}`
+                    title: 'Branches',
+                    link: `${teamOrUserSlug}/${projectSlug}`,
                 },
                 {
                     title: 'Prebuilds',
-                    link: `/${teamOrUserSlug}/${projectName}/prebuilds`
+                    link: `${teamOrUserSlug}/${projectSlug}/prebuilds`,
                 },
                 {
-                    title: 'Configure',
-                    link: `/${teamOrUserSlug}/${projectName}/configure`
-                }
+                    title: 'Settings',
+                    link: `${teamOrUserSlug}/${projectSlug}/settings`,
+                    alternatives: getProjectSettingsMenu({ slug: projectSlug } as Project, team).flatMap(e => e.link),
+                },
             ];
         }
         // Team menu
         if (team) {
-            return [
+            const currentUserInTeam = (teamMembers[team.id] || []).find(m => m.userId === user?.id);
+
+            const teamSettingsList = [
                 {
                     title: 'Projects',
-                    link: `/${team.slug}/projects`,
-                    alternatives: [`/${team.slug}`]
+                    link: `/t/${team.slug}/projects`,
+                    alternatives: ([] as string[])
                 },
                 {
                     title: 'Members',
-                    link: `/${team.slug}/members`
+                    link: `/t/${team.slug}/members`
                 }
             ];
+            if (currentUserInTeam?.role === "owner") {
+                teamSettingsList.push({
+                    title: 'Settings',
+                    link: `/t/${team.slug}/settings`,
+                    alternatives: getTeamSettingsMenu(team).flatMap(e => e.link),
+                })
+            }
+
+            return teamSettingsList;
         }
         // User menu
         return [
-            ...(showTeamsUI ? [{
-                title: 'Projects',
-                link: '/projects'
-            }] : []),
             {
                 title: 'Workspaces',
                 link: '/workspaces',
                 alternatives: ['/']
+            },
+            {
+                title: 'Projects',
+                link: '/projects'
             },
             {
                 title: 'Settings',
@@ -139,20 +181,20 @@ export default function Menu() {
             link: 'https://www.gitpod.io/docs/',
         },
         {
-            title: 'Community',
-            link: 'https://community.gitpod.io/',
+            title: 'Help',
+            link: 'https://www.gitpod.io/support',
         }
     ];
 
     const renderTeamMenu = () => {
         return (
             <div className="flex p-1 pl-3 ">
-                <div className="flex h-full rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 px-2 py-1">
-                    <Link to={team ? `/${team.slug}/projects` : "/workspaces"}>
+                { projectSlug && <div className="flex h-full rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 px-2 py-1">
+                    <Link to={team ? `/t/${team.slug}/projects` : `/projects`}>
                         <span className="text-base text-gray-600 dark:text-gray-400 font-semibold">{team?.name || userFullName}</span>
                     </Link>
-                </div>
-                <div className="flex h-full rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 py-1">
+                </div> }
+                <div className="flex h-full rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800">
                     <ContextMenu classes="w-64 left-0" menuEntries={[
                         {
                             title: userFullName,
@@ -160,8 +202,9 @@ export default function Menu() {
                                 <span className="text-gray-800 dark:text-gray-100 text-base font-semibold">{userFullName}</span>
                                 <span className="">Personal Account</span>
                             </div>,
+                            active: !team,
                             separator: true,
-                            onClick: () => history.push("/"),
+                            link: '/',
                         },
                         ...(teams || []).map(t => ({
                             title: t.name,
@@ -172,8 +215,9 @@ export default function Menu() {
                                     : '...'
                                 }</span>
                             </div>,
+                            active: team && team.id === t.id,
                             separator: true,
-                            onClick: () => history.push(`/${t.slug}`),
+                            link: `/t/${t.slug}`,
                         })).sort((a, b) => a.title.toLowerCase() > b.title.toLowerCase() ? 1 : -1),
                         {
                             title: 'Create a new team',
@@ -181,24 +225,25 @@ export default function Menu() {
                                 <span className="flex-1 font-semibold">New Team</span>
                                 <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 14 14" className="w-3.5"><path fill="currentColor" fill-rule="evenodd" d="M7 0a1 1 0 011 1v5h5a1 1 0 110 2H8v5a1 1 0 11-2 0V8H1a1 1 0 010-2h5V1a1 1 0 011-1z" clip-rule="evenodd" /></svg>
                             </div>,
-                            onClick: () => history.push("/teams/new"),
+                            link: '/teams/new',
                         }
                     ]}>
-                        <div className="flex h-full px-2 py-1.5">
-                            <img className="filter-grayscale m-auto" src={CaretUpDown} />
+                        <div className="flex h-full px-2 py-1 space-x-3.5">
+                            { !projectSlug && <span className="text-base text-gray-600 dark:text-gray-400 font-semibold">{team?.name || userFullName}</span>}
+                            <img alt="" aria-label="Toggle team selection menu" className="filter-grayscale" style={{marginTop: 5, marginBottom: 5}} src={CaretUpDown} />
                         </div>
                     </ContextMenu>
                 </div>
-                { projectName && (
+                { projectSlug && (
                     <div className="flex h-full rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 px-2 py-1">
-                        <Link to={`/${teamOrUserSlug}/${projectName}${prebuildId ? "/prebuilds" : ""}`}>
-                            <span className="text-base text-gray-600 dark:text-gray-400 font-semibold">{projectName}</span>
+                        <Link to={`${teamOrUserSlug}/${projectSlug}${prebuildId ? "/prebuilds" : ""}`}>
+                            <span className="text-base text-gray-600 dark:text-gray-400 font-semibold">{project?.name}</span>
                         </Link>
                     </div>
                 )}
                 { prebuildId && (
                     <div className="flex h-full ml-2 py-1">
-                        <img className="mr-3 filter-grayscale m-auto transform -rotate-90" src={CaretDown} />
+                        <img alt="" className="mr-3 filter-grayscale m-auto transform -rotate-90" src={CaretDown} />
                         <span className="text-base text-gray-600 dark:text-gray-400 font-semibold">{prebuildId}</span>
                     </div>
                 )}
@@ -207,24 +252,14 @@ export default function Menu() {
     }
 
     return <>
-        <header className={`lg:px-28 px-10 flex flex-col pt-4 space-y-4 ${isMinimalUI || !!prebuildId ? 'pb-4' : ''}`}>
+        <header className={`app-container flex flex-col pt-4 space-y-4 ${isMinimalUI || !!prebuildId ? 'pb-4' : ''}`} data-analytics='{"button_type":"menu"}'>
             <div className="flex h-10">
                 <div className="flex justify-between items-center pr-3">
                     <Link to="/">
-                        <img src={gitpodIcon} className="h-6" />
+                        <img src={gitpodIcon} className="h-6" alt="Gitpod's logo" />
                     </Link>
                     {!isMinimalUI && <div className="ml-2 text-base">
-                        {showTeamsUI
-                            ? renderTeamMenu()
-                            : <nav className="flex-1">
-                                <ul className="flex flex-1 items-center justify-between text-base text-gray-700 space-x-2">
-                                    <li className="flex-1"></li>
-                                    {leftMenu.map(entry => <li key={entry.title}>
-                                        <PillMenuItem name={entry.title} selected={isSelected(entry, location)} link={entry.link}/>
-                                    </li>)}
-                                </ul>
-                            </nav>
-                        }
+                        {renderTeamMenu()}
                     </div>}
                 </div>
                 <div className="flex flex-1 items-center w-auto" id="menu">
@@ -236,7 +271,7 @@ export default function Menu() {
                             </li>)}
                         </ul>
                     </nav>
-                    <div className="ml-3 flex items-center justify-start mb-0 pointer-cursor m-l-auto rounded-full border-2 border-transparent hover:border-gray-200 dark:hover:border-gray-700 p-0.5 font-medium">
+                    <div className="ml-3 flex items-center justify-start mb-0 pointer-cursor m-l-auto rounded-full border-2 border-transparent hover:border-gray-200 dark:hover:border-gray-700 p-0.5 font-medium" data-analytics='{"label":"Account"}'>
                         <ContextMenu menuEntries={[
                             {
                                 title: (user && User.getPrimaryEmail(user)) || '',
@@ -258,10 +293,10 @@ export default function Menu() {
                     </div>
                 </div>
             </div>
-            {!isMinimalUI && showTeamsUI && !prebuildId && <div className="flex">
-                {leftMenu.map((entry: Entry) => <TabMenuItem name={entry.title} selected={isSelected(entry, location)} link={entry.link}/>)}
-            </div>}
+            {!isMinimalUI && !prebuildId && <nav className="flex">
+                {leftMenu.map((entry: Entry) => <TabMenuItem key={entry.title} name={entry.title} selected={isSelected(entry, location)} link={entry.link}/>)}
+            </nav>}
         </header>
-        {showTeamsUI && <Separator />}
+        <Separator />
     </>;
 }

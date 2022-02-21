@@ -25,7 +25,7 @@ import settingsMenu from "./settings-menu";
 export default function Integrations() {
 
     return (<div>
-        <PageWithSubMenu subMenu={settingsMenu} title='Integrations' subtitle='Manage permissions for git providers and integrations.'>
+        <PageWithSubMenu subMenu={settingsMenu} title='Integrations' subtitle='Manage permissions for Git providers and integrations.'>
             <GitProviders />
             <div className="h-12"></div>
             <GitIntegrations />
@@ -43,6 +43,7 @@ function GitProviders() {
     const [disconnectModal, setDisconnectModal] = useState<{ provider: AuthProviderInfo } | undefined>(undefined);
     const [editModal, setEditModal] = useState<{ provider: AuthProviderInfo, prevScopes: Set<string>, nextScopes: Set<string> } | undefined>(undefined);
     const [selectAccountModal, setSelectAccountModal] = useState<SelectAccountPayload | undefined>(undefined);
+    const [errorMessage, setErrorMessage] = useState<string | undefined>();
 
     useEffect(() => {
         updateAuthProviders();
@@ -131,14 +132,15 @@ function GitProviders() {
             search: `returnTo=${returnTo}&host=${ap.host}`
         }).toString();
 
-        try {
-            await fetch(deauthorizeUrl);
-            console.log(`Deauthorized for ${ap.host}`);
-
-            updateUser();
-        } catch (error) {
-            console.log(`Failed to deauthorize for ${ap.host}`);
-        }
+        fetch(deauthorizeUrl)
+            .then((res) => {
+                if (!res.ok) {
+                    throw Error("Fetch failed");
+                }
+                return res;
+            })
+            .then((response) => updateUser())
+            .catch((error) => setErrorMessage("You cannot disconnect this integration because it is required for authentication and logging in with this account."))
     }
 
     const startEditPermissions = async (provider: AuthProviderInfo) => {
@@ -248,6 +250,13 @@ function GitProviders() {
             />
         )}
 
+        {errorMessage && (
+            <div className="flex rounded-md bg-red-600 p-3 mb-4">
+                <img className="w-4 h-4 mx-2 my-auto filter-brightness-10" src={exclamation} />
+                <span className="text-white">{errorMessage}</span>
+            </div>
+        )}
+
         {editModal && (
             <Modal visible={true} onClose={() => setEditModal(undefined)}>
                 <h3 className="pb-2">Edit Permissions</h3>
@@ -280,7 +289,7 @@ function GitProviders() {
         )}
 
         <h3>Git Providers</h3>
-        <h2>Manage permissions for git providers.</h2>
+        <h2>Manage permissions for Git providers.</h2>
         <ItemsList className="pt-6">
             {authProviders && authProviders.map(ap => (
                 <Item key={"ap-" + ap.authProviderId} className="h-16">
@@ -289,17 +298,17 @@ function GitProviders() {
                             &nbsp;
                         </div>
                     </ItemFieldIcon>
-                    <ItemField className="w-4/12 xl:w-3/12 flex flex-col">
+                    <ItemField className="w-4/12 xl:w-3/12 flex flex-col my-auto">
                         <span className="my-auto font-medium truncate overflow-ellipsis">{ap.authProviderType}</span>
-                        <span className="text-sm my-auto text-gray-400 truncate overflow-ellipsis">{ap.host}</span>
+                        <span className="text-sm my-auto text-gray-400 truncate overflow-ellipsis dark:text-gray-500">{ap.host}</span>
                     </ItemField>
-                    <ItemField className="w-6/12 xl:w-3/12 flex flex-col">
-                        <span className="my-auto truncate text-gray-500 overflow-ellipsis">{getUsername(ap.authProviderId) || "–"}</span>
-                        <span className="text-sm my-auto text-gray-400">Username</span>
+                    <ItemField className="w-6/12 xl:w-3/12 flex flex-col my-auto">
+                        <span className="my-auto truncate text-gray-500 overflow-ellipsis dark:text-gray-400">{getUsername(ap.authProviderId) || "–"}</span>
+                        <span className="text-sm my-auto text-gray-400 dark:text-gray-500">Username</span>
                     </ItemField>
-                    <ItemField className="hidden xl:w-5/12 xl:flex xl:flex-col">
-                        <span className="my-auto truncate text-gray-500 overflow-ellipsis">{getPermissions(ap.authProviderId)?.join(", ") || "–"}</span>
-                        <span className="text-sm my-auto text-gray-400">Permissions</span>
+                    <ItemField className="hidden xl:w-5/12 xl:flex xl:flex-col my-auto">
+                        <span className="my-auto truncate text-gray-500 overflow-ellipsis dark:text-gray-400">{getPermissions(ap.authProviderId)?.join(", ") || "–"}</span>
+                        <span className="text-sm my-auto text-gray-400 dark:text-gray-500">Permissions</span>
                     </ItemField>
                     <ItemFieldContextMenu menuEntries={gitProviderMenu(ap)} />
                 </Item>
@@ -360,12 +369,12 @@ function GitIntegrations() {
         {modal?.mode === "delete" && (
             <ConfirmationModal
                 title="Remove Integration"
-                areYouSureText="Are you sure you want to remove the following git integration?"
+                areYouSureText="Are you sure you want to remove the following Git integration?"
                 children={{
                     name: modal.provider.type,
                     description: modal.provider.host,
                 }}
-                buttonText="Delete Workspace"
+                buttonText="Remove Integration"
                 onClose={() => setModal(undefined)}
                 onConfirm={() => deleteProvider(modal.provider)}
             />
@@ -375,7 +384,7 @@ function GitIntegrations() {
         <div className="flex items-start sm:justify-between mb-2">
             <div>
                 <h3>Git Integrations</h3>
-                <h2 className="text-gray-500">Manage git integrations for GitLab or GitHub self-hosted instances.</h2>
+                <h2>Manage Git integrations for GitLab or GitHub self-hosted instances.</h2>
             </div>
             {providers.length !== 0
                 ?
@@ -402,10 +411,10 @@ function GitIntegrations() {
                             &nbsp;
                         </div>
                     </ItemFieldIcon>
-                    <ItemField className="w-3/12 flex flex-col">
+                    <ItemField className="w-3/12 flex flex-col my-auto">
                         <span className="font-medium truncate overflow-ellipsis">{ap.type}</span>
                     </ItemField>
-                    <ItemField className="w-7/12 flex flex-col">
+                    <ItemField className="w-7/12 flex flex-col my-auto">
                         <span className="my-auto truncate text-gray-500 overflow-ellipsis">{ap.host}</span>
                     </ItemField>
                     <ItemFieldContextMenu menuEntries={gitProviderMenu(ap)} />
@@ -516,6 +525,7 @@ export function GitIntegrationModal(props: ({
                     updateProviderEntry();
                     onUpdate();
                     props.onAuthorize && props.onAuthorize(payload);
+                    onClose();
                 },
                 onError: (payload) => {
                     updateProviderEntry();
@@ -601,8 +611,8 @@ export function GitIntegrationModal(props: ({
 
         return (<span>
             Use this redirect URL to update the OAuth application.
-            Go to <a href={`https://${settingsUrl}`} target="_blank" rel="noopener" className="text-gray-400 learn-more hover:text-gray-600">developer settings</a> and setup the OAuth application.&nbsp;
-            <a href={docsUrl} target="_blank" rel="noopener" className="text-gray-400 learn-more hover:text-gray-600">Learn more</a>.
+            Go to <a href={`https://${settingsUrl}`} target="_blank" rel="noopener" className="gp-link">developer settings</a> and setup the OAuth application.&nbsp;
+            <a href={docsUrl} target="_blank" rel="noopener" className="gp-link">Learn more</a>.
         </span>);
     }
 
@@ -625,7 +635,7 @@ export function GitIntegrationModal(props: ({
                 <AlertBox>You need to activate this integration.</AlertBox>
             )}
             <div className="flex flex-col">
-                <span className="text-gray-500">{props.headerText || "Configure a git integration with a GitLab or GitHub self-hosted instance."}</span>
+                <span className="text-gray-500">{props.headerText || "Configure a Git integration with a GitLab or GitHub self-hosted instance."}</span>
             </div>
 
             <div className="overscroll-contain max-h-96 overflow-y-auto pr-2">

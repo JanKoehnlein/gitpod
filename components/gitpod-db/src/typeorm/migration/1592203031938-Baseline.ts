@@ -6,7 +6,7 @@
 
 import { MigrationInterface, QueryRunner } from "typeorm";
 
-import { BUILTIN_WORKSPACE_PROBE_USER_NAME } from "../../user-db";
+import { BUILTIN_WORKSPACE_PROBE_USER_ID } from "../../user-db";
 
 export class Baseline1592203031938 implements MigrationInterface {
 
@@ -52,7 +52,7 @@ export class Baseline1592203031938 implements MigrationInterface {
         // features repositories
         {
             const count = (await queryRunner.query(`SELECT COUNT(1) AS cnt FROM d_b_repository_white_list`))[0].cnt;
-            if (count < 1) {
+            if (Number.parseInt(count) < 1) {
                 const entries = [
                     { url: 'https://github.com/gitpod-io/go-gin-app.git', description: '**Go** - A simple web app implemented in Go and Gin', priority: 7 },
                     { url: 'https://github.com/gitpod-io/rails_sample_app', description: '**Ruby on Rails** - Tutorial sample application', priority: 6 },
@@ -81,7 +81,7 @@ export class Baseline1592203031938 implements MigrationInterface {
         {
             const exists = (await queryRunner.query(`SELECT COUNT(1) AS cnt FROM d_b_user WHERE id = 'builtin-user-workspace-probe-0000000'`))[0].cnt == 1;
             if (!exists) {
-                await queryRunner.query(`INSERT IGNORE INTO d_b_user (id, creationDate, avatarUrl, name, fullName) VALUES ('builtin-user-workspace-probe-0000000', '${new Date().toISOString()}', '', '${BUILTIN_WORKSPACE_PROBE_USER_NAME}', '')`)
+                await queryRunner.query(`INSERT IGNORE INTO d_b_user (id, creationDate, avatarUrl, name, fullName) VALUES ('${BUILTIN_WORKSPACE_PROBE_USER_ID}', '${new Date().toISOString()}', '', 'builtin-workspace-prober', '')`)
             }
         }
     }

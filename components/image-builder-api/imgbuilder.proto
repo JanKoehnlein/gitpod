@@ -109,6 +109,7 @@ enum BuildStatus {
 message LogsRequest {
     string build_ref = 1;
     bool censored = 2;
+    string build_id = 3;
 }
 
 message LogsResponse {
@@ -126,4 +127,11 @@ message BuildInfo {
     string base_ref = 4;
     BuildStatus status = 2;
     int64 started_at = 3;
+    string build_id = 5;
+    LogInfo log_info = 6;
+}
+
+message LogInfo {
+    string url = 1;
+    map<string, string> headers = 2;
 }

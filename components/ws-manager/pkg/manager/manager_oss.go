@@ -2,6 +2,7 @@
 // Licensed under the GNU Affero General Public License (AGPL).
 // See License-AGPL.txt in the project root for license information.
 
+//go:build oss
 // +build oss
 
 package manager
@@ -29,5 +30,10 @@ func (m *Manager) ControlAdmission(ctx context.Context, req *api.ControlAdmissio
 
 // SetTimeout changes the default timeout for a running workspace
 func (m *Manager) SetTimeout(ctx context.Context, req *api.SetTimeoutRequest) (res *api.SetTimeoutResponse, err error) {
+	return nil, errEnterpriseFeature
+}
+
+// BackupWorkspace creates a copy of the workspace content and stores it so that another workspace can be created from it.
+func (m *Manager) BackupWorkspace(ctx context.Context, req *api.BackupWorkspaceRequest) (res *api.BackupWorkspaceResponse, err error) {
 	return nil, errEnterpriseFeature
 }

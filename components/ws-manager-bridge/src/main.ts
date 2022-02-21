@@ -7,14 +7,15 @@
 import { Container } from 'inversify';
 import * as express from 'express';
 import * as prometheusClient from 'prom-client';
-import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
+import { log, LogrusLogLevel } from '@gitpod/gitpod-protocol/lib/util/logging';
 import { MessageBusIntegration } from './messagebus-integration';
 import { TypeORM } from '@gitpod/gitpod-db/lib/typeorm/typeorm';
 import { TracingManager } from '@gitpod/gitpod-protocol/lib/util/tracing';
 import { ClusterServiceServer } from './cluster-service-server';
 import { BridgeController } from './bridge-controller';
+import { MetaInstanceController } from './meta-instance-controller';
 
-log.enableJSONLogging('ws-manager-bridge', process.env.VERSION);
+log.enableJSONLogging('ws-manager-bridge', undefined, LogrusLogLevel.getFromEnv());
 
 export const start = async (container: Container) => {
     try {
@@ -28,13 +29,14 @@ export const start = async (container: Container) => {
         tracingManager.setup("ws-manager-bridge");
 
         const metricsApp = express();
-        prometheusClient.collectDefaultMetrics({ timeout: 5000 });
-        metricsApp.get('/metrics', (req, res) => {
-            res.send(prometheusClient.register.metrics().toString());
+        prometheusClient.collectDefaultMetrics();
+        metricsApp.get('/metrics', async (req, res) => {
+            res.set('Content-Type', prometheusClient.register.contentType);
+            res.send(await prometheusClient.register.metrics());
         });
         const metricsPort = 9500;
-        const metricsHttpServer = metricsApp.listen(metricsPort, () => {
-            log.info(`prometheus metrics server running on: ${metricsPort}`);
+        const metricsHttpServer = metricsApp.listen(metricsPort, 'localhost', () => {
+            log.info(`prometheus metrics server running on: localhost:${metricsPort}`);
         });
 
         const bridgeController = container.get<BridgeController>(BridgeController);
@@ -42,6 +44,9 @@ export const start = async (container: Container) => {
 
         const clusterServiceServer = container.get<ClusterServiceServer>(ClusterServiceServer);
         await clusterServiceServer.start();
+
+        const metaInstanceController = container.get<MetaInstanceController>(MetaInstanceController);
+        metaInstanceController.start();
 
         process.on('SIGTERM', async () => {
             log.info("SIGTERM received, stopping");

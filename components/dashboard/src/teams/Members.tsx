@@ -17,6 +17,7 @@ import copy from '../images/copy.svg';
 import { getGitpodService } from "../service/service";
 import { UserContext } from "../user-context";
 import { TeamsContext, getCurrentTeam } from "./teams-context";
+import { trackEvent } from "../Analytics";
 
 
 export default function() {
@@ -30,6 +31,7 @@ export default function() {
     const [ showInviteModal, setShowInviteModal ] = useState<boolean>(false);
     const [ searchText, setSearchText ] = useState<string>('');
     const [ roleFilter, setRoleFilter ] = useState<TeamMemberRole | undefined>();
+    const [ leaveTeamEnabled, setLeaveTeamEnabled ] = useState<boolean>(false);
 
     useEffect(() => {
         if (!team) {
@@ -44,6 +46,12 @@ export default function() {
             setGenericInvite(invite);
         })();
     }, [ team ]);
+
+    useEffect(() => {
+        const owners = members.filter(m => m.role === "owner");
+        const isOwner = owners.some(o => o.userId === user?.id);
+        setLeaveTeamEnabled(!isOwner || owners.length > 1);
+    }, [ members ]);
 
     const ownMemberInfo = members.find(m => m.userId === user?.id);
 
@@ -110,7 +118,7 @@ export default function() {
 
     return <>
         <Header title="Members" subtitle="Manage team members." />
-        <div className="lg:px-28 px-10">
+        <div className="app-container">
             <div className="flex mt-8">
                 <div className="flex">
                     <div className="py-4">
@@ -131,36 +139,41 @@ export default function() {
                         onClick: () => setRoleFilter('member')
                     }]} />
                 </div>
-                <button onClick={() => setShowInviteModal(true)} className="ml-2">Invite Members</button>
+                <button onClick={() => {
+                    trackEvent("invite_url_requested",{
+                        invite_url: getInviteURL(genericInvite!.id)
+                    });
+                    setShowInviteModal(true);
+                }
+                } className="ml-2">Invite Members</button>
             </div>
             <ItemsList className="mt-2">
                 <Item header={true} className="grid grid-cols-3">
-                    <ItemField>
+                    <ItemField className="my-auto">
                         <span className="pl-14">Name</span>
                     </ItemField>
-                    <ItemField className="flex items-center space-x-1">
+                    <ItemField className="flex items-center space-x-1 my-auto">
                         <span>Joined</span>
                         <svg xmlns="http://www.w3.org/2000/svg" fill="none" className="h-4 w-4" viewBox="0 0 16 16"><path fill="#A8A29E" fill-rule="evenodd" d="M13.366 8.234a.8.8 0 010 1.132l-4.8 4.8a.8.8 0 01-1.132 0l-4.8-4.8a.8.8 0 111.132-1.132L7.2 11.67V2.4a.8.8 0 111.6 0v9.269l3.434-3.435a.8.8 0 011.132 0z" clip-rule="evenodd"/></svg>
                     </ItemField>
-                    <ItemField className="flex items-center">
+                    <ItemField className="flex items-center my-auto">
                         <span className="flex-grow">Role</span>
-                        <ItemFieldContextMenu />
                     </ItemField>
                 </Item>
                 {filteredMembers.length === 0
                     ? <p className="pt-16 text-center">No members found</p>
                     : filteredMembers.map(m => <Item className="grid grid-cols-3" key={m.userId}>
-                        <ItemField className="flex items-center">
+                        <ItemField className="flex items-center my-auto">
                             <div className="w-14">{m.avatarUrl && <img className="rounded-full w-8 h-8" src={m.avatarUrl || ''} alt={m.fullName} />}</div>
                             <div>
                                 <div className="text-base text-gray-900 dark:text-gray-50 font-medium">{m.fullName}</div>
                                 <p>{m.primaryEmail}</p>
                             </div>
                         </ItemField>
-                        <ItemField>
+                        <ItemField className="my-auto">
                             <span className="text-gray-400">{moment(m.memberSince).fromNow()}</span>
                         </ItemField>
-                        <ItemField className="flex items-center">
+                        <ItemField className="flex items-center my-auto">
                             <span className="text-gray-400 capitalize">{ownMemberInfo?.role !== 'owner'
                                 ? m.role
                                 : <DropDown contextMenuWidth="w-32" activeEntry={m.role} entries={[{
@@ -173,9 +186,9 @@ export default function() {
                             <span className="flex-grow" />
                             <ItemFieldContextMenu menuEntries={m.userId === user?.id
                                 ? [{
-                                    title: 'Leave Team',
-                                    customFontStyle: 'text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300',
-                                    onClick: () => removeTeamMember(m.userId)
+                                    title: leaveTeamEnabled ? 'Leave Team' : 'Remaining owner',
+                                    customFontStyle: leaveTeamEnabled ? 'text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300' : 'text-gray-400 dark:text-gray-200',
+                                    onClick: () => leaveTeamEnabled && removeTeamMember(m.userId)
                                 }]
                                 : (ownMemberInfo?.role === 'owner'
                                     ? [{
@@ -183,7 +196,7 @@ export default function() {
                                         customFontStyle: 'text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300',
                                         onClick: () => removeTeamMember(m.userId)
                                     }]
-                                    : undefined)} />
+                                    : [])} />
                         </ItemField>
                     </Item>)}
             </ItemsList>

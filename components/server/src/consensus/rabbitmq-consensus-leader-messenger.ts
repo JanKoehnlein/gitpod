@@ -8,7 +8,7 @@ import { ConsensusLeaderMessenger, ConsensusLeaderMessageType, RaftMessage, Requ
 import { injectable } from "inversify";
 import { Disposable } from "@gitpod/gitpod-protocol";
 import { AbstractMessageBusIntegration, AbstractTopicListener } from "@gitpod/gitpod-messagebus/lib";
-import * as uuid from 'uuid/v4';
+import { v4 as uuidv4 } from 'uuid';
 import { EventEmitter } from "events";
 import { TraceContext } from "@gitpod/gitpod-protocol/lib/util/tracing";
 import { CancellationTokenSource } from "vscode-jsonrpc/lib/cancellation";
@@ -24,11 +24,11 @@ export class RabbitMQConsensusLeaderMessenger extends AbstractMessageBusIntegrat
     async connect(): Promise<void> {
         await super.connect();
 
-        this.setupExchangeAndQueue();
+        this.setupExchangeAndQueue().catch(err => {/** ignore */});
     }
 
     async register(uid?: string | undefined): Promise<string> {
-        uid = uid || uuid();
+        uid = uid || uuidv4();
         await this.doRegister(uid);
         this.registrations.push(uid);
 
@@ -67,7 +67,8 @@ export class RabbitMQConsensusLeaderMessenger extends AbstractMessageBusIntegrat
         }
 
         const cancellationTokenSource = new CancellationTokenSource()
-        this.listen(new EventListener(exchangeConsensusLeader, forwarder), cancellationTokenSource.token);
+        this.listen(new EventListener(exchangeConsensusLeader, forwarder), cancellationTokenSource.token)
+            .catch(err => {/** ignore */});
         return Disposable.create(() => cancellationTokenSource.cancel())
     }
 

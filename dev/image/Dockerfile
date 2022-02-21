@@ -2,23 +2,14 @@
 # Licensed under the GNU Affero General Public License (AGPL).
 # See License-AGPL.txt in the project root for license information.
 
-FROM gitpod/workspace-full-vnc:latest
+# if you want to run this image in a workspace, follow these steps:
+# gcloud auth configure-docker europe-docker.pkg.dev
+# gcloud auth login --no-launch-browser
+FROM europe-docker.pkg.dev/gitpod-artifacts/docker-dev/workspace-full-vnc:2022-01-28-04-35-05
 
-ENV TRIGGER_REBUILD 12
-ENV WORKSPACE_KERNEL 5.4.0-1044-gke
+ENV TRIGGER_REBUILD 16
 
 USER root
-
-### QEMU (x86) and workspace kernel development tools
-RUN install-packages qemu qemu-system-x86 linux-image-$WORKSPACE_KERNEL libguestfs-tools openssh-sftp-server
-RUN ln -s /usr/lib/sftp-server /usr/libexec/sftp-server
-
-### Clang and LLVM
-RUN install-packages clang-7 llvm-7
-
-### Build QEMU VM
-COPY config prepare-bpf-dev-environment.sh code workspace.mount workspace.automount /root/
-RUN /root/prepare-bpf-dev-environment.sh
 
 ### cloud_sql_proxy ###
 ARG CLOUD_SQL_PROXY=/usr/local/bin/cloud_sql_proxy
@@ -27,15 +18,15 @@ RUN curl -fsSL https://dl.google.com/cloudsql/cloud_sql_proxy.linux.amd64 > $CLO
 
 ### Helm3 ###
 RUN mkdir -p /tmp/helm/ \
-    && curl -fsSL https://get.helm.sh/helm-v3.6.0-linux-amd64.tar.gz | tar -xzvC /tmp/helm/ --strip-components=1 \
+    && curl -fsSL https://get.helm.sh/helm-v3.7.1-linux-amd64.tar.gz | tar -xzvC /tmp/helm/ --strip-components=1 \
     && cp /tmp/helm/helm /usr/local/bin/helm \
-    && cp /tmp/helm/helm /usr/local/bin/helm3 \
+    && ln -s /usr/local/bin/helm /usr/local/bin/helm3 \
     && rm -rf /tmp/helm/ \
     && helm completion bash > /usr/share/bash-completion/completions/helm
 
 ### kubernetes ###
 RUN mkdir -p /usr/local/kubernetes/ && \
-    curl -fsSL https://github.com/kubernetes/kubernetes/releases/download/v1.17.16/kubernetes.tar.gz \
+    curl -fsSL https://github.com/kubernetes/kubernetes/releases/download/v1.22.4/kubernetes.tar.gz \
     | tar -xzvC /usr/local/kubernetes/ --strip-components=1 \
     && KUBERNETES_SKIP_CONFIRM=true /usr/local/kubernetes/cluster/get-kube-binaries.sh \
     && chown gitpod:gitpod -R /usr/local/kubernetes
@@ -46,13 +37,13 @@ ENV PATH=$PATH:/usr/local/kubernetes/cluster/:/usr/local/kubernetes/client/bin/
 RUN curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add - \
     # really 'xenial'
     && add-apt-repository -yu "deb https://apt.kubernetes.io/ kubernetes-xenial main" \
-    && install-packages kubectl=1.20.0-00 \
+    && install-packages kubectl=1.22.4-00 \
     && kubectl completion bash > /usr/share/bash-completion/completions/kubectl
 
 RUN curl -fsSL -o /usr/bin/kubectx https://raw.githubusercontent.com/ahmetb/kubectx/master/kubectx && chmod +x /usr/bin/kubectx \
     && curl -fsSL -o /usr/bin/kubens  https://raw.githubusercontent.com/ahmetb/kubectx/master/kubens  && chmod +x /usr/bin/kubens
 
-RUN curl -fsSL https://go.kubebuilder.io/dl/2.3.2/linux/amd64 | tar -xz -C /tmp/ \
+RUN curl -fsSL https://github.com/kubernetes-sigs/kubebuilder/releases/download/v2.3.2/kubebuilder_2.3.2_linux_amd64.tar.gz | tar -xz -C /tmp/ \
     && sudo mkdir -p /usr/local/kubebuilder \
     && sudo mv /tmp/kubebuilder_2.3.2_linux_amd64/* /usr/local/kubebuilder \
     && rm -rf /tmp/*
@@ -61,19 +52,22 @@ RUN curl -fsSL https://go.kubebuilder.io/dl/2.3.2/linux/amd64 | tar -xz -C /tmp/
 RUN install-packages mysql-client
 
 # golangci-lint
-RUN cd /usr/local && curl -fsSL https://install.goreleaser.com/github.com/golangci/golangci-lint.sh | sh -s v1.39.0
+RUN cd /usr/local && curl -fsSL https://install.goreleaser.com/github.com/golangci/golangci-lint.sh | sh -s v1.42.0
+
+# gokart
+RUN cd /usr/bin && curl -L https://github.com/praetorian-inc/gokart/releases/download/v0.3.0/gokart_0.3.0_linux_x86_64.tar.gz | tar xzv gokart
 
 # leeway
-ENV LEEWAY_NESTED_WORKSPACE=true
-RUN cd /usr/bin && curl -fsSL https://github.com/TypeFox/leeway/releases/download/v0.2.5/leeway_0.2.5_Linux_x86_64.tar.gz | tar xz
+ENV LEEWAY_MAX_PROVENANCE_BUNDLE_SIZE=8388608
+RUN cd /usr/bin && curl -fsSL https://github.com/gitpod-io/leeway/releases/download/v0.2.16/leeway_0.2.16_Linux_x86_64.tar.gz | tar xz
 
 # dazzle
-RUN cd /usr/bin && curl -fsSL https://github.com/32leaves/dazzle/releases/download/v0.0.3/dazzle_0.0.3_Linux_x86_64.tar.gz | tar xz
+RUN cd /usr/bin && curl -fsSL https://github.com/gitpod-io/dazzle/releases/download/v0.1.4/dazzle_0.1.4_Darwin_x86_64.tar.gz| tar xz
 
 # werft CLI
 ENV WERFT_K8S_NAMESPACE=werft
 ENV WERFT_DIAL_MODE=kubernetes
-RUN cd /usr/bin && curl -fsSL https://github.com/csweichel/werft/releases/download/v0.0.5rc/werft-client-linux-amd64.tar.gz | tar xz && mv werft-client-linux-amd64 werft
+RUN cd /usr/bin && curl -fsSL https://github.com/csweichel/werft/releases/download/v0.1.4/werft-client-linux-amd64.tar.gz | tar xz && mv werft-client-linux-amd64 werft
 
 # yq - jq for YAML files
 # Note: we rely on version 3.x.x in various places, 4.x breaks this!
@@ -85,7 +79,7 @@ RUN cd /usr/bin && curl -fsSL https://github.com/c4milo/github-release/releases/
 ### Protobuf
 RUN set -ex \
     && tmpdir=$(mktemp -d) \
-    && curl -fsSL -o $tmpdir/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v3.17.3/protoc-3.17.3-linux-x86_64.zip \
+    && curl -fsSL -o $tmpdir/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v3.19.1/protoc-3.19.1-linux-x86_64.zip \
     && mkdir -p /usr/lib/protoc && cd /usr/lib/protoc && unzip $tmpdir/protoc.zip \
     && chmod -R o+r+x /usr/lib/protoc/include \
     && chmod -R +x /usr/lib/protoc/bin \
@@ -108,16 +102,31 @@ RUN curl -fsSL https://packagecloud.io/datawireio/telepresence/gpgkey | apt-key 
 RUN curl -fsSL -o /usr/bin/toxiproxy https://github.com/Shopify/toxiproxy/releases/download/v2.1.4/toxiproxy-cli-linux-amd64 \
     && chmod +x /usr/bin/toxiproxy
 
-### libseccomp > 2.5.0
+### libseccomp > 2.5.2
 RUN install-packages gperf \
     && cd $(mktemp -d) \
-    && curl -fsSL https://github.com/seccomp/libseccomp/releases/download/v2.5.1/libseccomp-2.5.1.tar.gz | tar xz \
-    && cd libseccomp-2.5.1 && ./configure && make && make install
+    && curl -fsSL https://github.com/seccomp/libseccomp/releases/download/v2.5.2/libseccomp-2.5.2.tar.gz | tar xz \
+    && cd libseccomp-2.5.2 && ./configure && make && make install
+
+### Cypress deps
+RUN install-packages \
+    libgtk2.0-0 \
+    libgtk-3-0 \
+    libgbm-dev \
+    libnotify-dev \
+    libgconf-2-4 \
+    libnss3 \
+    libxss1 \
+    libasound2 \
+    libxtst6 \
+    xauth
+# Install netcat to use it as proxy for SSH access to Harvester VMs
+RUN install-packages netcat
 
 USER gitpod
 
 # Fix node version we develop against
-ARG GITPOD_NODE_VERSION=12.22.1
+ARG GITPOD_NODE_VERSION=16.14.0
 RUN bash -c ". .nvm/nvm.sh \
     && nvm install $GITPOD_NODE_VERSION \
     && npm install -g typescript yarn"
@@ -135,7 +144,7 @@ ARG GCS_DIR=/opt/google-cloud-sdk
 ENV PATH=$GCS_DIR/bin:$PATH
 RUN sudo chown gitpod: /opt \
     && mkdir $GCS_DIR \
-    && curl -fsSL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-344.0.0-linux-x86_64.tar.gz \
+    && curl -fsSL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-354.0.0-linux-x86_64.tar.gz \
     | tar -xzvC /opt \
     && /opt/google-cloud-sdk/install.sh --quiet --usage-reporting=false --bash-completion=true \
     --additional-components docker-credential-gcr alpha beta \
@@ -148,7 +157,7 @@ RUN sudo install-packages \
     python-dev \
     python-setuptools
 
-RUN bash -c "pip uninstall crcmod; pip install --no-cache-dir -U crcmod"
+RUN sudo python3 -m pip uninstall crcmod; sudo python3 -m pip install --no-cache-dir -U crcmod
 
 ### gitpod-core specific gcloud/kubectl config
 # Copy GCloud default config that points to gitpod-dev
@@ -168,10 +177,10 @@ ENV LEEWAY_WORKSPACE_ROOT=/workspace/gitpod
 ENV LEEWAY_REMOTE_CACHE_BUCKET=gitpod-core-leeway-cache-branch
 
 ### AWS Cli ###
-RUN pip install --no-cache-dir awscli
+RUN sudo python3 -m pip install --no-cache-dir awscli
 
 # Install aws-iam-authenticator
-RUN sudo curl -fsSL -o aws-iam-authenticator "https://amazon-eks.s3-us-west-2.amazonaws.com/1.13.7/2019-06-11/bin/linux/amd64/aws-iam-authenticator" \
+RUN sudo curl -fsSL -o aws-iam-authenticator "https://amazon-eks.s3.us-west-2.amazonaws.com/1.21.2/2021-07-05/bin/linux/amd64/aws-iam-authenticator" \
     && sudo chmod +x ./aws-iam-authenticator \
     && sudo mkdir -p $HOME/.aws-iam \
     && sudo mv ./aws-iam-authenticator $HOME/.aws-iam/aws-iam-authenticator \
@@ -198,4 +207,29 @@ RUN sudo curl -fsSL https://uploader.codecov.io/latest/codecov-linux -o /usr/loc
 
 # Install pre-commit https://pre-commit.com/#install
 RUN sudo install-packages shellcheck \
-    && sudo pip3 install pre-commit
+    && sudo python3 -m pip install pre-commit
+
+# Install observability-related binaries
+ARG PROM_VERSION="2.30.0"
+RUN curl -LO https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz && \
+    tar -xzvf prometheus-${PROM_VERSION}.linux-amd64.tar.gz && \
+    sudo mv prometheus-${PROM_VERSION}.linux-amd64/promtool /usr/local/bin/promtool && \
+    rm -rf prometheus-${PROM_VERSION}.linux-amd64/
+
+ARG JSONNET_BUNDLER_VERSION="0.4.0"
+RUN curl -L -o jb https://github.com/jsonnet-bundler/jsonnet-bundler/releases/download/v${JSONNET_BUNDLER_VERSION}/jb-linux-amd64 && \
+    chmod +x jb && sudo mv jb /usr/local/bin
+
+ARG JSONNET_VERSION="0.17.0"
+RUN curl -LO https://github.com/google/go-jsonnet/releases/download/v${JSONNET_VERSION}/go-jsonnet_${JSONNET_VERSION}_Linux_x86_64.tar.gz && \
+    tar -xzvf go-jsonnet_${JSONNET_VERSION}_Linux_x86_64.tar.gz && \
+    sudo mv jsonnet /usr/local/bin/jsonnet && \
+    sudo mv jsonnetfmt /usr/local/bin/jsonnetfmt
+
+ARG GOJSONTOYAML_VERSION="0.1.0"
+RUN curl -LO https://github.com/brancz/gojsontoyaml/releases/download/v${GOJSONTOYAML_VERSION}/gojsontoyaml_${GOJSONTOYAML_VERSION}_linux_amd64.tar.gz && \
+    tar -xzvf gojsontoyaml_${GOJSONTOYAML_VERSION}_linux_amd64.tar.gz && \
+    sudo mv gojsontoyaml /usr/local/bin/gojsontoyaml
+
+# Copy our own tools
+COPY dev-kubecdl--app/kubecdl dev-gpctl--app/gpctl /usr/bin/

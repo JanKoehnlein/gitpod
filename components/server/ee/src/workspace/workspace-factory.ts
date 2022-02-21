@@ -4,22 +4,24 @@
  * See License.enterprise.txt in the project root folder.
  */
 
-import * as uuidv4 from 'uuid/v4';
+import { v4 as uuidv4 } from 'uuid';
 import { WorkspaceFactory } from "../../../src/workspace/workspace-factory";
 import { injectable, inject } from "inversify";
 import { TraceContext } from "@gitpod/gitpod-protocol/lib/util/tracing";
-import { User, StartPrebuildContext, Workspace, CommitContext, PrebuiltWorkspaceContext, WorkspaceContext, WithSnapshot, WithPrebuild, TaskConfig } from "@gitpod/gitpod-protocol";
+import { User, StartPrebuildContext, Workspace, CommitContext, PrebuiltWorkspaceContext, WorkspaceContext, WithSnapshot, WithPrebuild, TaskConfig, Project, PrebuiltWorkspace } from "@gitpod/gitpod-protocol";
 import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
 import { LicenseEvaluator } from '@gitpod/licensor/lib';
 import { Feature } from '@gitpod/licensor/lib/api';
 import { ResponseError } from 'vscode-jsonrpc';
 import { ErrorCodes } from '@gitpod/gitpod-protocol/lib/messaging/error';
-import { generateWorkspaceID } from '@gitpod/gitpod-protocol/lib/util/generate-workspace-id';
+import { HostContextProvider } from '../../../src/auth/host-context-provider';
+import { RepoURL } from '../../../src/repohost';
 
 @injectable()
 export class WorkspaceFactoryEE extends WorkspaceFactory {
 
     @inject(LicenseEvaluator) protected readonly licenseEvaluator: LicenseEvaluator;
+    @inject(HostContextProvider) protected readonly hostContextProvider: HostContextProvider;
 
     protected requireEELicense(feature: Feature) {
         if (!this.licenseEvaluator.isEnabled(feature)) {
@@ -57,7 +59,7 @@ export class WorkspaceFactoryEE extends WorkspaceFactory {
                 }
             }
 
-            const config = await this.configProvider.fetchConfig({span}, user, context.actual);
+            const { config } = await this.configProvider.fetchConfig({span}, user, context.actual);
             const imageSource = await this.imageSourceProvider.getImageSource(ctx, user, context.actual, config);
 
             // Walk back the commit history to find suitable parent prebuild to start an incremental prebuild on.
@@ -106,6 +108,13 @@ export class WorkspaceFactoryEE extends WorkspaceFactory {
                     prebuiltWorkspace: parentPrebuild,
                 }
                 ws = await this.createForPrebuiltWorkspace({span}, user, incrementalPrebuildContext, normalizedContextURL);
+                // Overwrite the config from the parent prebuild:
+                //   `createForPrebuiltWorkspace` 1:1 copies the config from the parent prebuild.
+                //   Above, we've made sure that the parent's prebuild tasks (before/init/prebuild) are still the same as now.
+                //   However, other non-prebuild config items might be outdated (e.g. any command task, VS Code extension, ...)
+                //   To fix this, we overwrite the new prebuild's config with the most-recently fetched config.
+                // See also: https://github.com/gitpod-io/gitpod/issues/7475
+                ws.config = config;
                 break;
             }
 
@@ -114,6 +123,7 @@ export class WorkspaceFactoryEE extends WorkspaceFactory {
                 ws = await this.createForCommit({span}, user, commitContext, normalizedContextURL);
             }
             ws.type = "prebuild";
+            ws.projectId = project?.id;
             ws = await this.db.trace({span}).store(ws);
 
             const pws = await this.db.trace({span}).storePrebuiltWorkspace({
@@ -123,29 +133,71 @@ export class WorkspaceFactoryEE extends WorkspaceFactory {
                 commit: commitContext.revision,
                 state: "queued",
                 creationTime: new Date().toISOString(),
-                projectId: project?.id,
+                projectId: ws.projectId,
                 branch
             });
+
+            if (project) {
+                // do not await
+                this.storePrebuildInfo(ctx, project, pws, ws, user).catch(err => {
+                    log.error(`failed to store prebuild info`, err);
+                    TraceContext.setError({span}, err);
+                });
+            }
 
             log.debug({ userId: user.id, workspaceId: ws.id }, `Registered workspace prebuild: ${pws.id} for ${commitContext.repository.cloneUrl}:${commitContext.revision}`);
 
             return ws;
         } catch (e) {
-            TraceContext.logError({span}, e);
+            TraceContext.setError({span}, e);
             throw e;
         } finally {
             span.finish();
         }
     }
 
+    protected async storePrebuildInfo(ctx: TraceContext, project: Project, pws: PrebuiltWorkspace, ws: Workspace, user: User) {
+        const span = TraceContext.startSpan("storePrebuildInfo", ctx);
+        const { userId, teamId, name: projectName, id: projectId } = project;
+        const parsedUrl = RepoURL.parseRepoUrl(project.cloneUrl);
+        if (!parsedUrl) {
+            return;
+        }
+        const { owner, repo, host } = parsedUrl;
+        const repositoryProvider = this.hostContextProvider.get(host)?.services?.repositoryProvider;
+        if (!repositoryProvider) {
+            return;
+        }
+        const commit = await repositoryProvider.getCommitInfo(user, owner, repo, pws.commit);
+        if (!commit) {
+            return;
+        }
+        await this.db.trace({span}).storePrebuildInfo({
+            id: pws.id,
+            buildWorkspaceId: pws.buildWorkspaceId,
+            basedOnPrebuildId: ws.basedOnPrebuildId,
+            teamId,
+            userId,
+            projectName,
+            projectId,
+            startedAt: pws.creationTime,
+            startedBy: "", // TODO
+            startedByAvatar: "", // TODO
+            cloneUrl: pws.cloneURL,
+            branch: pws.branch || "unknown",
+            changeAuthor: commit.author,
+            changeAuthorAvatar: commit.authorAvatarUrl,
+            changeDate: commit.authorDate || "",
+            changeHash: commit.sha,
+            changeTitle: commit.commitMessage,
+            // changePR
+            changeUrl: ws.contextURL,
+        });
+    }
+
     protected async createForPrebuiltWorkspace(ctx: TraceContext, user: User, context: PrebuiltWorkspaceContext, normalizedContextURL: string): Promise<Workspace> {
         this.requireEELicense(Feature.FeaturePrebuild);
         const span = TraceContext.startSpan("createForPrebuiltWorkspace", ctx);
-
-        const fallback = await this.fallbackIfOutPrebuildTime(ctx, user, context, normalizedContextURL);
-        if (!!fallback) {
-            return fallback;
-        }
 
         try {
             const buildWorkspaceID = context.prebuiltWorkspace.buildWorkspaceId;
@@ -160,13 +212,27 @@ export class WorkspaceFactoryEE extends WorkspaceFactory {
                 extensions: config && config.vscode && config.vscode.extensions || []
             }
 
-            const id = await generateWorkspaceID();
+            const project = await this.projectDB.findProjectByCloneUrl(context.prebuiltWorkspace.cloneURL);
+            let projectId: string | undefined;
+            // associate with a project, if it's the personal project of the current user
+            if (project?.userId && project?.userId === user.id) {
+                projectId = project.id;
+            }
+            // associate with a project, if the current user is a team member
+            if (project?.teamId) {
+                const teams = await this.teamDB.findTeamsByUser(user.id);
+                if (teams.some(t => t.id === project?.teamId)) {
+                    projectId = project.id;
+                }
+            }
+
+            const id = await this.generateWorkspaceID(context);
             const newWs: Workspace = {
                 id,
                 type: "regular",
                 creationTime: new Date().toISOString(),
                 contextURL: normalizedContextURL,
-                projectId: context.prebuiltWorkspace.projectId,
+                projectId,
                 description: this.getDescription(context),
                 ownerId: user.id,
                 context: <WorkspaceContext & WithSnapshot & WithPrebuild>{
@@ -184,22 +250,11 @@ export class WorkspaceFactoryEE extends WorkspaceFactory {
             await this.db.trace({span}).store(newWs);
             return newWs;
         } catch (e) {
-            TraceContext.logError({span}, e);
+            TraceContext.setError({span}, e);
             throw e;
         } finally {
             span.finish();
         }
-    }
-
-    protected async fallbackIfOutPrebuildTime(ctx: TraceContext, user: User, context: PrebuiltWorkspaceContext, normalizedContextURL: string): Promise<Workspace | undefined> {
-        const prebuildTime = await this.db.trace({}).getTotalPrebuildUseSeconds(30);
-        if (!this.licenseEvaluator.canUsePrebuild(prebuildTime || 0)) {
-            // TODO: find a way to signal the out-of-prebuild-time situation
-            log.warn({}, "cannot use prebuild because enterprise license prevents it", {prebuildTime});
-            return this.createForContext(ctx, user, context.originalContext, normalizedContextURL);
-        }
-
-        return;
     }
 
 }

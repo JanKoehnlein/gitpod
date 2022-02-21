@@ -8,8 +8,8 @@ import { injectable, inject } from "inversify";
 import { AuthProviderEntry as AuthProviderEntry, User } from "@gitpod/gitpod-protocol";
 import { AuthProviderParams } from "./auth-provider";
 import { AuthProviderEntryDB } from "@gitpod/gitpod-db/lib";
-import { Env } from "../env";
-import * as uuidv4 from 'uuid/v4';
+import { Config } from "../config";
+import { v4 as uuidv4 } from 'uuid';
 import { oauthUrls as githubUrls } from "../github/github-urls";
 import { oauthUrls as gitlabUrls } from "../gitlab/gitlab-urls";
 import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
@@ -20,8 +20,8 @@ export class AuthProviderService {
     @inject(AuthProviderEntryDB)
     protected authProviderDB: AuthProviderEntryDB;
 
-    @inject(Env)
-    protected env: Env;
+    @inject(Config)
+    protected readonly config: Config;
 
     /**
      * Returns all auth providers.
@@ -31,14 +31,16 @@ export class AuthProviderService {
         const transformed = all.map(this.toAuthProviderParams.bind(this));
 
         // as a precaution, let's remove duplicates
-        const unique = transformed.reduce((prev, current) => {
-            const duplicate = prev.some(a => a.host === current.host);
+        const unique = new Map<string, AuthProviderParams>();
+        for (const current of transformed) {
+            const duplicate = unique.get(current.host);
             if (duplicate) {
                 log.warn(`Duplicate dynamic Auth Provider detected.`, { rawResult: all, duplicate: current.host });
+                continue;
             }
-            return duplicate ? prev : [...prev, current];
-        }, [] as AuthProviderParams[]);
-        return unique;
+            unique.set(current.host, current);
+        }
+        return Array.from(unique.values());
     }
 
     protected toAuthProviderParams = (oap: AuthProviderEntry) => <AuthProviderParams>{
@@ -145,10 +147,10 @@ export class AuthProviderService {
 
     protected callbackUrl = (host: string) => {
         const pathname = `/auth/${host}/callback`;
-        if (this.env.devBranch) {
+        if (this.config.devBranch) {
             // for example: https://staging.gitpod-dev.com/auth/mydomain.com/gitlab/callback
-            return this.env.hostUrl.withoutDomainPrefix(1).with({ pathname }).toString();
+            return this.config.hostUrl.withoutDomainPrefix(1).with({ pathname }).toString();
         }
-        return this.env.hostUrl.with({ pathname }).toString();
+        return this.config.hostUrl.with({ pathname }).toString();
     };
 }

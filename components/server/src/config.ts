@@ -5,38 +5,64 @@
  */
 
 import { GitpodHostUrl } from '@gitpod/gitpod-protocol/lib/util/gitpod-host-url';
-import { AuthProviderParams } from './auth/auth-provider';
+import { AuthProviderParams, normalizeAuthProviderParams } from './auth/auth-provider';
 
-import { Branding, NamedWorkspaceFeatureFlag } from '@gitpod/gitpod-protocol';
+import { NamedWorkspaceFeatureFlag } from '@gitpod/gitpod-protocol';
 
 import { RateLimiterConfig } from './auth/rate-limiter';
-import { Env } from './env';
 import { CodeSyncConfig } from './code-sync/code-sync-service';
-import { ChargebeeProviderOptions } from "@gitpod/gitpod-payment-endpoint/lib/chargebee";
-import { EnvEE } from '../ee/src/env';
+import { ChargebeeProviderOptions, readOptionsFromFile } from "@gitpod/gitpod-payment-endpoint/lib/chargebee";
+import * as fs from 'fs';
+import * as yaml from 'js-yaml';
+import { log, LogrusLogLevel } from '@gitpod/gitpod-protocol/lib/util/logging';
+import { filePathTelepresenceAware, KubeStage, translateLegacyStagename } from '@gitpod/gitpod-protocol/lib/env';
 
 export const Config = Symbol("Config");
-export interface Config {
-    version: string;
+export type Config = Omit<ConfigSerialized, "hostUrl" | "chargebeeProviderOptionsFile"> & {
+    stage: KubeStage;
     hostUrl: GitpodHostUrl;
+    workspaceDefaults: WorkspaceDefaults;
+    chargebeeProviderOptions?: ChargebeeProviderOptions;
+}
 
-    license: string | undefined;
-    trialLicensePrivateKey: string | undefined;
+export interface WorkspaceDefaults {
+    workspaceImage: string;
+    previewFeatureFlags: NamedWorkspaceFeatureFlag[];
+    defaultFeatureFlags: NamedWorkspaceFeatureFlag[];
+}
 
-    heartbeat: {
+export interface WorkspaceGarbageCollection {
+    disabled: boolean;
+    startDate: number;
+    chunkLimit: number;
+    minAgeDays: number;
+    minAgePrebuildDays: number;
+    contentRetentionPeriodDays: number;
+    contentChunkLimit: number;
+}
+
+/**
+ * This is the config shape as found in the configuration file, e.g. server-configmap.yaml
+ */
+export interface ConfigSerialized {
+    version: string;
+    hostUrl: string;
+    installationShortname: string;
+    stage: string;
+    devBranch?: string;
+    insecureNoDomain: boolean;
+    logLevel: LogrusLogLevel;
+
+    // Use one or other - licenseFile reads from a file and populates license
+    license?: string;
+    licenseFile?: string;
+
+    workspaceHeartbeat: {
         intervalSeconds: number;
         timeoutSeconds: number,
     };
 
-    workspaceDefaults: {
-        ideVersion: string;
-        ideImageRepo: string;
-        ideImage: string;
-        ideImageAliases: { [index: string]: string };
-        workspaceImage: string;
-        previewFeatureFlags: NamedWorkspaceFeatureFlag[];
-        defaultFeatureFlags: NamedWorkspaceFeatureFlag[];
-    };
+    workspaceDefaults: Omit<WorkspaceDefaults, "ideImage">;
 
     session: {
         maxAgeMs: number;
@@ -46,32 +72,23 @@ export interface Config {
     githubApp?: {
         enabled: boolean;
         appId: number;
+        baseUrl?: string;
         webhookSecret: string;
         authProviderId: string;
         certPath: string;
         marketplaceName: string;
-        logLevel?: string;
     };
 
     definitelyGpDisabled: boolean;
 
-    workspaceGarbageCollection: {
-        disabled: boolean;
-        startDate: number;
-        chunkLimit: number;
-        minAgeDays: number;
-        minAgePrebuildDays: number;
-        contentRetentionPeriodDays: number;
-        contentChunkLimit: number;
-    };
+    workspaceGarbageCollection: WorkspaceGarbageCollection;
 
     enableLocalApp: boolean;
 
     authProviderConfigs: AuthProviderParams[];
+    authProviderConfigFiles: string[];
+    builtinAuthProvidersConfigured: boolean;
     disableDynamicAuthProviderLogin: boolean;
-
-    // TODO(gpl) Can we remove this?
-    brandingConfig: Branding;
 
     /**
      * The maximum number of environment variables a user can have configured in their list at any given point in time.
@@ -83,7 +100,7 @@ export interface Config {
     maxConcurrentPrebuildsPerRef: number;
 
     incrementalPrebuilds: {
-        repositoryPassList: string[];
+        repositoryPasslist: string[];
         commitHistory: number;
     };
 
@@ -95,13 +112,10 @@ export interface Config {
     makeNewUsersAdmin: boolean;
 
     /** this value - if present - overrides the default naming scheme for the GCloud bucket that Theia Plugins are stored in */
-    theiaPluginsBucketNameOverride: string | undefined;
+    theiaPluginsBucketNameOverride?: string;
 
     /** defaultBaseImageRegistryWhitelist is the list of registryies users get acces to by default */
     defaultBaseImageRegistryWhitelist: string[];
-
-    // TODO(gpl): can we remove this? We never set the value anywhere it seems
-    insecureNoDomain: boolean;
 
     runDbDeleter: boolean;
 
@@ -119,100 +133,80 @@ export interface Config {
      * The address content service clients connect to
      * Example: content-service:8080
     */
-    contentServiceAddress: string;
+    contentServiceAddr: string;
 
     /**
-     * TODO(gpl) Looks like this is not used anymore! Verify and remove
-     */
-    serverProxyApiKey?: string;
+     * The address content service clients connect to
+     * Example: image-builder:8080
+    */
+    imageBuilderAddr: string;
 
-    codeSyncConfig: CodeSyncConfig;
+    codeSync: CodeSyncConfig;
+
+    vsxRegistryUrl: string;
 
     /**
      * Payment related options
      */
-    chargebeeProviderOptions?: ChargebeeProviderOptions;
+    chargebeeProviderOptionsFile?: string;
     enablePayment?: boolean;
 }
 
-export namespace EnvConfig {
-    export function fromEnv(env: Env): Config {
-        return {
-            version: env.version,
-            hostUrl: env.hostUrl,
-            license: env.gitpodLicense,
-            trialLicensePrivateKey: env.trialLicensePrivateKey,
-            heartbeat: {
-                intervalSeconds: env.theiaHeartbeatInterval,
-                timeoutSeconds: env.workspaceUserTimeout,
-            },
-            workspaceDefaults: {
-                ideVersion: env.theiaVersion,
-                ideImageRepo: env.theiaImageRepo,
-                ideImage: env.ideDefaultImage,
-                ideImageAliases: env.ideImageAliases,
-                workspaceImage: env.workspaceDefaultImage,
-                previewFeatureFlags: env.previewFeatureFlags,
-                defaultFeatureFlags: env.defaultFeatureFlags,
-            },
-            session: {
-                maxAgeMs: env.sessionMaxAgeMs,
-                secret: env.sessionSecret,
-            },
-            githubApp: {
-                enabled: env.githubAppEnabled,
-                appId: env.githubAppAppID,
-                webhookSecret: env.githubAppWebhookSecret,
-                authProviderId: env.githubAppAuthProviderId,
-                certPath: env.githubAppCertPath,
-                marketplaceName: env.githubAppMarketplaceName,
-                logLevel: env.githubAppLogLevel,
-            },
-            definitelyGpDisabled: env.definitelyGpDisabled,
-            workspaceGarbageCollection: {
-                disabled: env.garbageCollectionDisabled,
-                startDate: env.garbageCollectionStartDate,
-                chunkLimit: env.garbageCollectionLimit,
-                minAgeDays: env.daysBeforeGarbageCollection,
-                minAgePrebuildDays: env.daysBeforeGarbageCollectingPrebuilds,
-                contentRetentionPeriodDays: env.workspaceDeletionRetentionPeriodDays,
-                contentChunkLimit: env.workspaceDeletionLimit,
-            },
-            enableLocalApp: env.enableLocalApp,
-            authProviderConfigs: env.authProviderConfigs,
-            disableDynamicAuthProviderLogin: env.disableDynamicAuthProviderLogin,
-            brandingConfig: env.brandingConfig,
-            maxEnvvarPerUserCount: env.maxUserEnvvarCount,
-            maxConcurrentPrebuildsPerRef: env.maxConcurrentPrebuildsPerRef,
-            incrementalPrebuilds: {
-                repositoryPassList: env.incrementalPrebuildsRepositoryPassList,
-                commitHistory: env.incrementalPrebuildsCommitHistory,
-            },
-            blockNewUsers: {
-                enabled: env.blockNewUsers,
-                passlist: env.blockNewUsersPassList,
-            },
-            makeNewUsersAdmin: env.makeNewUsersAdmin,
-            theiaPluginsBucketNameOverride: env.theiaPluginsBucketNameOverride,
-            defaultBaseImageRegistryWhitelist: env.defaultBaseImageRegistryWhitelist,
-            insecureNoDomain: env.insecureNoDomain,
-            runDbDeleter: env.runDbDeleter,
-            oauthServer: {
-                enabled: env.enableOAuthServer,
-                jwtSecret: env.oauthServerJWTSecret,
-            },
-            rateLimiter: env.rateLimiter,
-            contentServiceAddress: env.contentServiceAddress,
-            serverProxyApiKey: env.serverProxyApiKey,
-            codeSyncConfig: env.codeSyncConfig,
-        };
+export namespace ConfigFile {
+    export function fromFile(path: string | undefined = process.env.CONFIG_PATH): Config {
+        if (!path) {
+            throw new Error("config load error: CONFIG_PATH not set!");
+        }
+        try {
+            const configStr = fs.readFileSync(filePathTelepresenceAware(path), { encoding: "utf-8" }).toString();
+            const configSerialized: ConfigSerialized = JSON.parse(configStr);
+            return loadAndCompleteConfig(configSerialized);
+        } catch (err) {
+            log.error("config parse error", err);
+            process.exit(1);
+        }
     }
-    export function fromEnvEE(env: EnvEE): Config {
-        const config = EnvConfig.fromEnv(env);
+
+    function loadAndCompleteConfig(config: ConfigSerialized): Config {
+        const hostUrl = new GitpodHostUrl(config.hostUrl);
+        let authProviderConfigs: AuthProviderParams[] = []
+        const rawProviderConfigs = config.authProviderConfigs
+        if (rawProviderConfigs) {
+            /* Add raw provider data */
+            authProviderConfigs.push(...rawProviderConfigs);
+        }
+        const rawProviderConfigFiles = config.authProviderConfigFiles
+        if (rawProviderConfigFiles) {
+            /* Add providers from files */
+            const authProviderConfigFiles: AuthProviderParams[] = rawProviderConfigFiles.map<AuthProviderParams>((providerFile) => {
+                const rawProviderData = fs.readFileSync(filePathTelepresenceAware(providerFile), "utf-8")
+
+                return yaml.load(rawProviderData) as AuthProviderParams
+            });
+
+            authProviderConfigs.push(...authProviderConfigFiles);
+        }
+        authProviderConfigs = normalizeAuthProviderParams(authProviderConfigs)
+
+        const builtinAuthProvidersConfigured = authProviderConfigs.length > 0;
+        const chargebeeProviderOptions = readOptionsFromFile(filePathTelepresenceAware(config.chargebeeProviderOptionsFile || ""));
+        let license = config.license
+        const licenseFile = config.licenseFile
+        if (licenseFile) {
+            license = fs.readFileSync(filePathTelepresenceAware(licenseFile), "utf-8");
+        }
         return {
             ...config,
-            chargebeeProviderOptions: env.chargebeeProviderOptions,
-            enablePayment: env.enablePayment,
+            stage: translateLegacyStagename(config.stage),
+            hostUrl,
+            authProviderConfigs,
+            builtinAuthProvidersConfigured,
+            chargebeeProviderOptions,
+            license,
+            workspaceGarbageCollection: {
+                ...config.workspaceGarbageCollection,
+                startDate: config.workspaceGarbageCollection.startDate ? new Date(config.workspaceGarbageCollection.startDate).getTime() : Date.now(),
+            },
         }
     }
 }

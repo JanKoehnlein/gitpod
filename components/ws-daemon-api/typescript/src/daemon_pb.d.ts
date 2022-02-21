@@ -136,6 +136,8 @@ export namespace WaitForInitResponse {
 export class TakeSnapshotRequest extends jspb.Message {
     getId(): string;
     setId(value: string): TakeSnapshotRequest;
+    getReturnImmediately(): boolean;
+    setReturnImmediately(value: boolean): TakeSnapshotRequest;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): TakeSnapshotRequest.AsObject;
@@ -150,6 +152,7 @@ export class TakeSnapshotRequest extends jspb.Message {
 export namespace TakeSnapshotRequest {
     export type AsObject = {
         id: string,
+        returnImmediately: boolean,
     }
 }
 
@@ -219,6 +222,46 @@ export class DisposeWorkspaceResponse extends jspb.Message {
 export namespace DisposeWorkspaceResponse {
     export type AsObject = {
         gitStatus?: content_service_api_initializer_pb.GitStatus.AsObject,
+    }
+}
+
+export class BackupWorkspaceRequest extends jspb.Message {
+    getId(): string;
+    setId(value: string): BackupWorkspaceRequest;
+
+    serializeBinary(): Uint8Array;
+    toObject(includeInstance?: boolean): BackupWorkspaceRequest.AsObject;
+    static toObject(includeInstance: boolean, msg: BackupWorkspaceRequest): BackupWorkspaceRequest.AsObject;
+    static extensions: {[key: number]: jspb.ExtensionFieldInfo<jspb.Message>};
+    static extensionsBinary: {[key: number]: jspb.ExtensionFieldBinaryInfo<jspb.Message>};
+    static serializeBinaryToWriter(message: BackupWorkspaceRequest, writer: jspb.BinaryWriter): void;
+    static deserializeBinary(bytes: Uint8Array): BackupWorkspaceRequest;
+    static deserializeBinaryFromReader(message: BackupWorkspaceRequest, reader: jspb.BinaryReader): BackupWorkspaceRequest;
+}
+
+export namespace BackupWorkspaceRequest {
+    export type AsObject = {
+        id: string,
+    }
+}
+
+export class BackupWorkspaceResponse extends jspb.Message {
+    getUrl(): string;
+    setUrl(value: string): BackupWorkspaceResponse;
+
+    serializeBinary(): Uint8Array;
+    toObject(includeInstance?: boolean): BackupWorkspaceResponse.AsObject;
+    static toObject(includeInstance: boolean, msg: BackupWorkspaceResponse): BackupWorkspaceResponse.AsObject;
+    static extensions: {[key: number]: jspb.ExtensionFieldInfo<jspb.Message>};
+    static extensionsBinary: {[key: number]: jspb.ExtensionFieldBinaryInfo<jspb.Message>};
+    static serializeBinaryToWriter(message: BackupWorkspaceResponse, writer: jspb.BinaryWriter): void;
+    static deserializeBinary(bytes: Uint8Array): BackupWorkspaceResponse;
+    static deserializeBinaryFromReader(message: BackupWorkspaceResponse, reader: jspb.BinaryReader): BackupWorkspaceResponse;
+}
+
+export namespace BackupWorkspaceResponse {
+    export type AsObject = {
+        url: string,
     }
 }
 

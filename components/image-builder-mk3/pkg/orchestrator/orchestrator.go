@@ -6,18 +6,10 @@ package orchestrator
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,19 +17,23 @@ import (
 	"sync"
 	"time"
 
-	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
+	"github.com/docker/distribution/reference"
+	"github.com/google/uuid"
 	"github.com/opentracing/opentracing-go"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 
+	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
 	csapi "github.com/gitpod-io/gitpod/content-service/api"
 	"github.com/gitpod-io/gitpod/image-builder/api"
 	protocol "github.com/gitpod-io/gitpod/image-builder/api"
+	"github.com/gitpod-io/gitpod/image-builder/api/config"
 	"github.com/gitpod-io/gitpod/image-builder/pkg/auth"
 	"github.com/gitpod-io/gitpod/image-builder/pkg/resolve"
 	wsmanapi "github.com/gitpod-io/gitpod/ws-manager/api"
@@ -52,43 +48,14 @@ const (
 
 	// workspaceBuildProcessVersion controls how we build workspace images.
 	// Incrementing this value will trigger a rebuild of all workspace images.
-	workspaceBuildProcessVersion = 1
+	workspaceBuildProcessVersion = 2
 )
 
-// Configuration configures the orchestrator
-type Configuration struct {
-	WorkspaceManager struct {
-		Address string `json:"address"`
-		TLS     struct {
-			Authority   string `json:"ca"`
-			Certificate string `json:"crt"`
-			PrivateKey  string `json:"key"`
-		} `json:"tls,omitempty"`
-	} `json:"wsman"`
-
-	// AuthFile points to a Docker configuration file from which we draw registry authentication
-	AuthFile string `json:"authFile"`
-
-	// BaseImageRepository configures repository where we'll push base images to.
-	BaseImageRepository string `json:"baseImageRepository"`
-
-	// WorkspaceImageRepository configures the repository where we'll push the final workspace images to.
-	// Note that the workspace nodes/kubelets need access to this repository.
-	WorkspaceImageRepository string `json:"workspaceImageRepository"`
-
-	// BuilderImage is an image ref to the workspace builder image
-	BuilderImage string `json:"builderImage"`
-
-	// BuilderAuthKeyFile points to a keyfile shared by the builder workspaces and this service.
-	// The key is used to encypt authentication data shipped across environment varibales.
-	BuilderAuthKeyFile string `json:"builderAuthKeyFile,omitempty"`
-}
-
 // NewOrchestratingBuilder creates a new orchestrating image builder
-func NewOrchestratingBuilder(cfg Configuration) (res *Orchestrator, err error) {
+func NewOrchestratingBuilder(cfg config.Configuration) (res *Orchestrator, err error) {
 	var authentication auth.RegistryAuthenticator
-	if cfg.AuthFile != "" {
-		fn := cfg.AuthFile
+	if cfg.PullSecretFile != "" {
+		fn := cfg.PullSecretFile
 		if tproot := os.Getenv("TELEPRESENCE_ROOT"); tproot != "" {
 			fn = filepath.Join(tproot, fn)
 		}
@@ -99,69 +66,31 @@ func NewOrchestratingBuilder(cfg Configuration) (res *Orchestrator, err error) {
 		}
 	}
 
-	var builderAuthKey [32]byte
-	if cfg.BuilderAuthKeyFile != "" {
-		fn := cfg.BuilderAuthKeyFile
-		if tproot := os.Getenv("TELEPRESENCE_ROOT"); tproot != "" {
-			fn = filepath.Join(tproot, fn)
-		}
-
-		var data []byte
-		data, err = ioutil.ReadFile(fn)
-		if err != nil {
-			return
-		}
-		if len(data) != 32 {
-			err = fmt.Errorf("builder auth key must be exactly 32 bytes long")
-			return
-		}
-		copy(builderAuthKey[:], data)
-	}
-
-	opts := []grpc.DialOption{
-		grpc.WithUnaryInterceptor(grpc_opentracing.UnaryClientInterceptor(grpc_opentracing.WithTracer(opentracing.GlobalTracer()))),
-		grpc.WithStreamInterceptor(grpc_opentracing.StreamClientInterceptor(grpc_opentracing.WithTracer(opentracing.GlobalTracer()))),
-	}
-	if cfg.WorkspaceManager.TLS.Authority != "" || cfg.WorkspaceManager.TLS.Certificate != "" && cfg.WorkspaceManager.TLS.PrivateKey != "" {
-		ca := cfg.WorkspaceManager.TLS.Authority
-		crt := cfg.WorkspaceManager.TLS.Certificate
-		key := cfg.WorkspaceManager.TLS.PrivateKey
-
-		// Telepresence (used for debugging only) requires special paths to load files from
-		if root := os.Getenv("TELEPRESENCE_ROOT"); root != "" {
-			ca = filepath.Join(root, ca)
-			crt = filepath.Join(root, crt)
-			key = filepath.Join(root, key)
-		}
-
-		rootCA, err := os.ReadFile(ca)
-		if err != nil {
-			return nil, xerrors.Errorf("could not read ca certificate: %s", err)
-		}
-		certPool := x509.NewCertPool()
-		if ok := certPool.AppendCertsFromPEM(rootCA); !ok {
-			return nil, xerrors.Errorf("failed to append ca certs")
-		}
-
-		certificate, err := tls.LoadX509KeyPair(crt, key)
-		if err != nil {
-			log.WithField("config", cfg.WorkspaceManager.TLS).Error("Cannot load ws-manager certs - this is a configuration issue.")
-			return nil, xerrors.Errorf("cannot load ws-manager certs: %w", err)
-		}
-
-		creds := credentials.NewTLS(&tls.Config{
-			ServerName:   "ws-manager",
-			Certificates: []tls.Certificate{certificate},
-			RootCAs:      certPool,
-			MinVersion:   tls.VersionTLS12,
-		})
-		opts = append(opts, grpc.WithTransportCredentials(creds))
+	var wsman wsmanapi.WorkspaceManagerClient
+	if c, ok := cfg.WorkspaceManager.Client.(wsmanapi.WorkspaceManagerClient); ok {
+		wsman = c
 	} else {
-		opts = append(opts, grpc.WithInsecure())
-	}
-	conn, err := grpc.Dial(cfg.WorkspaceManager.Address, opts...)
-	if err != nil {
-		return
+		grpcOpts := common_grpc.DefaultClientOptions()
+		if cfg.WorkspaceManager.TLS.Authority != "" || cfg.WorkspaceManager.TLS.Certificate != "" && cfg.WorkspaceManager.TLS.PrivateKey != "" {
+			tlsConfig, err := common_grpc.ClientAuthTLSConfig(
+				cfg.WorkspaceManager.TLS.Authority, cfg.WorkspaceManager.TLS.Certificate, cfg.WorkspaceManager.TLS.PrivateKey,
+				common_grpc.WithSetRootCAs(true),
+				common_grpc.WithServerName("ws-manager"),
+			)
+			if err != nil {
+				log.WithField("config", cfg.WorkspaceManager.TLS).Error("Cannot load ws-manager certs - this is a configuration issue.")
+				return nil, xerrors.Errorf("cannot load ws-manager certs: %w", err)
+			}
+
+			grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+		} else {
+			grpcOpts = append(grpcOpts, grpc.WithInsecure())
+		}
+		conn, err := grpc.Dial(cfg.WorkspaceManager.Address, grpcOpts...)
+		if err != nil {
+			return nil, err
+		}
+		wsman = wsmanapi.NewWorkspaceManagerClient(conn)
 	}
 
 	o := &Orchestrator{
@@ -173,11 +102,11 @@ func NewOrchestratingBuilder(cfg Configuration) (res *Orchestrator, err error) {
 		},
 		RefResolver: &resolve.StandaloneRefResolver{},
 
-		wsman:          wsmanapi.NewWorkspaceManagerClient(conn),
-		buildListener:  make(map[string]map[buildListener]struct{}),
-		logListener:    make(map[string]map[logListener]struct{}),
-		censorship:     make(map[string][]string),
-		builderAuthKey: builderAuthKey,
+		wsman:         wsman,
+		buildListener: make(map[string]map[buildListener]struct{}),
+		logListener:   make(map[string]map[logListener]struct{}),
+		censorship:    make(map[string][]string),
+		metrics:       newMetrics(),
 	}
 	o.monitor = newBuildMonitor(o, o.wsman)
 
@@ -186,20 +115,21 @@ func NewOrchestratingBuilder(cfg Configuration) (res *Orchestrator, err error) {
 
 // Orchestrator runs image builds by orchestrating headless build workspaces
 type Orchestrator struct {
-	Config       Configuration
+	Config       config.Configuration
 	Auth         auth.RegistryAuthenticator
 	AuthResolver auth.Resolver
 	RefResolver  resolve.DockerRefResolver
 
 	wsman wsmanapi.WorkspaceManagerClient
 
-	builderAuthKey [32]byte
-	buildListener  map[string]map[buildListener]struct{}
-	logListener    map[string]map[logListener]struct{}
-	censorship     map[string][]string
-	mu             sync.RWMutex
+	buildListener map[string]map[buildListener]struct{}
+	logListener   map[string]map[logListener]struct{}
+	censorship    map[string][]string
+	mu            sync.RWMutex
 
 	monitor *buildMonitor
+
+	metrics *metrics
 
 	protocol.UnimplementedImageBuilderServer
 }
@@ -277,6 +207,10 @@ func (o *Orchestrator) Build(req *protocol.BuildRequest, resp protocol.ImageBuil
 	defer tracing.FinishSpan(span, &err)
 	tracing.LogRequestSafe(span, req)
 
+	if req.Source == nil {
+		return status.Errorf(codes.InvalidArgument, "build source is missing")
+	}
+
 	// resolve build request authentication
 	reqauth := o.AuthResolver.ResolveRequestAuth(req.Auth)
 
@@ -327,8 +261,13 @@ func (o *Orchestrator) Build(req *protocol.BuildRequest, resp protocol.ImageBuil
 	ctx, cancel := context.WithTimeout(&parentCantCancelContext{Delegate: ctx}, maxBuildRuntime)
 	defer cancel()
 
+	randomUUID, err := uuid.NewRandom()
+	if err != nil {
+		return
+	}
+
 	var (
-		buildID        = computeBuildID(wsrefstr)
+		buildID        = randomUUID.String()
 		buildBase      = "false"
 		contextPath    = "."
 		dockerfilePath = "Dockerfile"
@@ -351,15 +290,6 @@ func (o *Orchestrator) Build(req *protocol.BuildRequest, resp protocol.ImageBuil
 	}
 	contextPath = filepath.Join("/workspace", strings.TrimPrefix(contextPath, "/workspace"))
 
-	baseLayerAuth, err := o.getAuthFor(reqauth)
-	if err != nil {
-		return
-	}
-	gplayerAuth, err := o.getAuthFor(reqauth.ExplicitlyAll(), wsrefstr, baseref)
-	if err != nil {
-		return
-	}
-
 	o.censor(buildID, []string{
 		wsrefstr,
 		baseref,
@@ -375,6 +305,17 @@ func (o *Orchestrator) Build(req *protocol.BuildRequest, resp protocol.ImageBuil
 			return true
 		}
 		return false
+	}
+
+	pbaseref, err := reference.Parse(baseref)
+	if err != nil {
+		return xerrors.Errorf("cannot parse baseref: %v", err)
+	}
+	bobBaseref := "localhost:8080/base"
+	if r, ok := pbaseref.(reference.Digested); ok {
+		bobBaseref += "@" + r.Digest().String()
+	} else {
+		bobBaseref += ":latest"
 	}
 
 	var swr *wsmanapi.StartWorkspaceResponse
@@ -393,28 +334,39 @@ func (o *Orchestrator) Build(req *protocol.BuildRequest, resp protocol.ImageBuil
 				Owner: buildWorkspaceOwnerID,
 			},
 			Spec: &wsmanapi.StartWorkspaceSpec{
-				CheckoutLocation:  ".",
-				Initializer:       initializer,
-				Timeout:           maxBuildRuntime.String(),
-				WorkspaceImage:    o.Config.BuilderImage,
-				IdeImage:          o.Config.BuilderImage,
+				CheckoutLocation:   ".",
+				Initializer:        initializer,
+				Timeout:            maxBuildRuntime.String(),
+				WorkspaceImage:     o.Config.BuilderImage,
+				DeprecatedIdeImage: o.Config.BuilderImage,
+				IdeImage: &wsmanapi.IDEImage{
+					WebRef: o.Config.BuilderImage,
+				},
 				WorkspaceLocation: contextPath,
 				Envvars: []*wsmanapi.EnvironmentVariable{
-					{Name: "BOB_TARGET_REF", Value: wsrefstr},
-					{Name: "BOB_BASE_REF", Value: baseref},
+					{Name: "BOB_TARGET_REF", Value: "localhost:8080/target:latest"},
+					{Name: "BOB_BASE_REF", Value: bobBaseref},
 					{Name: "BOB_BUILD_BASE", Value: buildBase},
-					{Name: "BOB_BASELAYER_AUTH", Value: baseLayerAuth},
-					{Name: "BOB_WSLAYER_AUTH", Value: gplayerAuth},
 					{Name: "BOB_DOCKERFILE_PATH", Value: dockerfilePath},
 					{Name: "BOB_CONTEXT_DIR", Value: contextPath},
-					{Name: "BOB_AUTH_KEY", Value: string(o.builderAuthKey[:])},
 					{Name: "GITPOD_TASKS", Value: `[{"name": "build", "init": "sudo -E /app/bob build"}]`},
+					{Name: "WORKSPACEKIT_RING2_ENCLAVE", Value: "/app/bob proxy"},
+					{Name: "WORKSPACEKIT_BOBPROXY_BASEREF", Value: baseref},
+					{Name: "WORKSPACEKIT_BOBPROXY_TARGETREF", Value: wsrefstr},
+					{
+						Name: "WORKSPACEKIT_BOBPROXY_AUTH",
+						Secret: &wsmanapi.EnvironmentVariable_SecretKeyRef{
+							SecretName: o.Config.PullSecret,
+							Key:        ".dockerconfigjson",
+						},
+					},
+					{Name: "SUPERVISOR_DEBUG_ENABLE", Value: fmt.Sprintf("%v", log.Log.Logger.IsLevelEnabled(logrus.DebugLevel))},
 				},
 			},
 			Type: wsmanapi.WorkspaceType_IMAGEBUILD,
 		})
 		return
-	}, retryIfUnavailable1, 1*time.Second, 5)
+	}, retryIfUnavailable1, 1*time.Second, 10)
 	if status.Code(err) == codes.AlreadyExists {
 		// build is already running - do not add it to the list of builds
 	} else if errors.Is(err, errOutOfRetries) {
@@ -433,6 +385,21 @@ func (o *Orchestrator) Build(req *protocol.BuildRequest, resp protocol.ImageBuil
 		if update == nil {
 			// channel was closed unexpectatly
 			return status.Error(codes.Aborted, "subscription canceled - please try again")
+		}
+
+		// The failed condition of ws-manager is not stable, hence we might wrongly report that the
+		// build was successful when in fact it wasn't. This would break workspace startup with a strange
+		// "cannot pull from reg.gitpod.io" error message. Instead the image-build should fail properly.
+		// To do this, we resolve the built image afterwards to ensure it was actually built.
+		if update.Status == protocol.BuildStatus_done_success {
+			exists, err := o.checkImageExists(ctx, wsrefstr, wsrefAuth)
+			if err != nil {
+				update.Status = protocol.BuildStatus_done_failure
+				update.Message = fmt.Sprintf("cannot check if workspace image exists after the build: %v", err)
+			} else if !exists {
+				update.Status = protocol.BuildStatus_done_failure
+				update.Message = "image build did not produce a workspace image"
+			}
 		}
 
 		err := resp.Send(update)
@@ -491,18 +458,17 @@ func (o *Orchestrator) Logs(req *protocol.LogsRequest, resp protocol.ImageBuilde
 	tracing.LogRequestSafe(span, req)
 
 	rb, err := o.monitor.GetAllRunningBuilds(ctx)
-	var found bool
+	var buildID string
 	for _, bld := range rb {
 		if bld.Info.Ref == req.BuildRef {
-			found = true
+			buildID = bld.Info.BuildId
 			break
 		}
 	}
-	if !found {
+	if buildID == "" {
 		return status.Error(codes.NotFound, "build not found")
 	}
 
-	buildID := computeBuildID(req.BuildRef)
 	logs, cancel := o.registerLogListener(buildID)
 	defer cancel()
 	for {
@@ -672,60 +638,6 @@ func (c *parentCantCancelContext) Err() error {
 
 func (c *parentCantCancelContext) Value(key interface{}) interface{} {
 	return c.Delegate.Value(key)
-}
-
-func computeBuildID(ref string) string {
-	// The buildID will be used as workspaceID which must not be longer than 63 characters because it's a kubernetes label.
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(ref)))
-
-	// Truncating hashes is fine according to NIST - and StackOverflow :)
-	// Note: the buildID is also used as servicePrefix for the StartWorkspace request and must match
-	//       the workspaceIDIdentifier regexp in ws-proxy
-	return fmt.Sprintf("%s-%s-%s", hash[0:16], hash[16:32], hash[32:40])
-}
-
-// source: https://astaxie.gitbooks.io/build-web-application-with-golang/en/09.6.html
-func encrypt(plaintext []byte, key [32]byte) ([]byte, error) {
-	c, err := aes.NewCipher(key[:])
-	if err != nil {
-		return nil, err
-	}
-
-	gcm, err := cipher.NewGCM(c)
-	if err != nil {
-		return nil, err
-	}
-
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, err
-	}
-
-	return gcm.Seal(nonce, nonce, plaintext, nil), nil
-}
-
-func (o *Orchestrator) getAuthFor(inp auth.AllowedAuthFor, refs ...string) (res string, err error) {
-	buildauth, err := inp.GetImageBuildAuthFor(o.Auth, refs)
-	if err != nil {
-		return
-	}
-	resb, err := json.Marshal(buildauth)
-	if err != nil {
-		return
-	}
-	res = string(resb)
-
-	if len(o.builderAuthKey) > 0 {
-		resb, err = encrypt(resb, o.builderAuthKey)
-		if err != nil {
-			return
-		}
-
-		// I know this call is really backwards, but the Encode() API is so difficult to use properly.
-		res = base64.RawStdEncoding.EncodeToString(resb)
-	}
-
-	return
 }
 
 type buildListener chan *api.BuildResponse

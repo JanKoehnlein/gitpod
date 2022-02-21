@@ -7,13 +7,16 @@ package seccomp
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/moby/sys/mountinfo"
 	"golang.org/x/sys/unix"
+	"golang.org/x/xerrors"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/workspacekit/pkg/readarg"
@@ -48,15 +51,15 @@ func mapHandler(h SyscallHandler) map[string]syscallHandler {
 func LoadFilter() (libseccomp.ScmpFd, error) {
 	filter, err := libseccomp.NewFilter(libseccomp.ActAllow)
 	if err != nil {
-		return 0, fmt.Errorf("cannot create filter: %w", err)
+		return 0, xerrors.Errorf("cannot create filter: %w", err)
 	}
 	err = filter.SetTsync(false)
 	if err != nil {
-		return 0, fmt.Errorf("cannot set tsync: %w", err)
+		return 0, xerrors.Errorf("cannot set tsync: %w", err)
 	}
 	err = filter.SetNoNewPrivsBit(false)
 	if err != nil {
-		return 0, fmt.Errorf("cannot set no_new_privs: %w", err)
+		return 0, xerrors.Errorf("cannot set no_new_privs: %w", err)
 	}
 
 	// we explicitly prohibit open_tree/move_mount to prevent container workloads
@@ -68,11 +71,11 @@ func LoadFilter() (libseccomp.ScmpFd, error) {
 	for _, sc := range deniedSyscalls {
 		syscallID, err := libseccomp.GetSyscallFromName(sc)
 		if err != nil {
-			return 0, fmt.Errorf("unknown syscall %s: %w", sc, err)
+			return 0, xerrors.Errorf("unknown syscall %s: %w", sc, err)
 		}
 		err = filter.AddRule(syscallID, libseccomp.ActErrno.SetReturnCode(int16(unix.EPERM)))
 		if err != nil {
-			return 0, fmt.Errorf("cannot add rule for %s: %w", sc, err)
+			return 0, xerrors.Errorf("cannot add rule for %s: %w", sc, err)
 		}
 	}
 
@@ -80,22 +83,22 @@ func LoadFilter() (libseccomp.ScmpFd, error) {
 	for sc := range handledSyscalls {
 		syscallID, err := libseccomp.GetSyscallFromName(sc)
 		if err != nil {
-			return 0, fmt.Errorf("unknown syscall %s: %w", sc, err)
+			return 0, xerrors.Errorf("unknown syscall %s: %w", sc, err)
 		}
 		err = filter.AddRule(syscallID, libseccomp.ActNotify)
 		if err != nil {
-			return 0, fmt.Errorf("cannot add rule for %s: %w", sc, err)
+			return 0, xerrors.Errorf("cannot add rule for %s: %w", sc, err)
 		}
 	}
 
 	err = filter.Load()
 	if err != nil {
-		return 0, fmt.Errorf("cannot load filter: %w", err)
+		return 0, xerrors.Errorf("cannot load filter: %w", err)
 	}
 
 	fd, err := filter.GetNotifFd()
 	if err != nil {
-		return 0, fmt.Errorf("cannot get inotif fd: %w", err)
+		return 0, xerrors.Errorf("cannot get inotif fd: %w", err)
 	}
 
 	return fd, nil
@@ -167,10 +170,19 @@ func Errno(err unix.Errno) (val uint64, errno int32, flags uint32) {
 	return ^uint64(0), int32(errno), 0
 }
 
+// IWSClientProvider provides a client to the in-workspace-service.
+// Consumers of this provider will close the client after use.
+type IWSClientProvider func(ctx context.Context) (InWorkspaceServiceClient, error)
+
+type InWorkspaceServiceClient interface {
+	daemonapi.InWorkspaceServiceClient
+	io.Closer
+}
+
 // InWorkspaceHandler is the seccomp notification handler that serves a Gitpod workspace
 type InWorkspaceHandler struct {
 	FD          libseccomp.ScmpFd
-	Daemon      daemonapi.InWorkspaceServiceClient
+	Daemon      IWSClientProvider
 	Ring2PID    int
 	Ring2Rootfs string
 	BindEvents  chan<- BindEvent
@@ -196,12 +208,11 @@ func (h *InWorkspaceHandler) Mount(req *libseccomp.ScmpNotifReq) (val uint64, er
 	}
 	defer memFile.Close()
 
-	// TODO(cw): find why this breaks
-	// err = libseccomp.NotifIDValid(fd, req.ID)
-	// if err != nil {
-	// 	log.WithError(err).Error("invalid notif ID")
-	// 	return Errno(unix.EPERM)
-	// }
+	err = libseccomp.NotifIDValid(h.FD, req.ID)
+	if err != nil {
+		log.WithError(err).Error("invalid notify ID", req.ID)
+		return Errno(unix.EPERM)
+	}
 
 	source, err := readarg.ReadString(memFile, int64(req.Data.Args[0]))
 	if err != nil {
@@ -223,58 +234,59 @@ func (h *InWorkspaceHandler) Mount(req *libseccomp.ScmpNotifReq) (val uint64, er
 		"source": source,
 		"dest":   dest,
 		"fstype": filesystem,
-	}).Info("handling mount syscall")
+	}).Debug("handling mount syscall")
 
-	if filesystem == "proc" {
+	if filesystem == "proc" || filesystem == "sysfs" {
+		// When a process wants to mount proc relative to `/proc/self` that path has no meaning outside of the processes' context.
+		// runc started doing this in https://github.com/opencontainers/runc/commit/0ca91f44f1664da834bc61115a849b56d22f595f
+		// TODO(cw): there must be a better way to handle this. Find one.
 		target := filepath.Join(h.Ring2Rootfs, dest)
+		if strings.HasPrefix(dest, "/proc/self/") {
+			target = filepath.Join("/proc", strconv.Itoa(int(req.Pid)), strings.TrimPrefix(dest, "/proc/self/"))
+		}
+
 		stat, err := os.Lstat(target)
 		if os.IsNotExist(err) {
 			err = os.MkdirAll(target, 0755)
 		}
 		if err != nil {
-			log.WithField("dest", dest).WithError(err).Error("cannot stat mountpoint")
+			log.WithField("target", target).WithField("dest", dest).WithError(err).Error("cannot stat mountpoint")
 			return Errno(unix.EFAULT)
-		} else if stat != nil && stat.Mode()&os.ModeDir == 0 {
-			log.WithField("dest", dest).WithError(err).Error("proc must be mounted on an ordinary directory")
-			return Errno(unix.EPERM)
+		}
+		if stat != nil {
+			if stat.Mode()&os.ModeSymlink != 0 {
+				// The symlink is already expressed relative to the ring2 mount namespace, no need to faff with the rootfs paths.
+				// In case this was a /proc relative symlink, we'll have that symlink resolved here, hence make it work in the mount namespace of ring2.
+				dest, err = os.Readlink(target)
+				if err != nil {
+					log.WithField("target", target).WithField("dest", dest).WithError(err).Errorf("cannot resolve %s mount target symlink", filesystem)
+					return Errno(unix.EFAULT)
+				}
+			} else if stat.Mode()&os.ModeDir == 0 {
+				log.WithField("target", target).WithField("dest", dest).WithField("mode", stat.Mode()).WithError(err).Errorf("%s must be mounted on an ordinary directory", filesystem)
+				return Errno(unix.EPERM)
+			}
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, err = h.Daemon.MountProc(ctx, &daemonapi.MountProcRequest{
+		iws, err := h.Daemon(ctx)
+		if err != nil {
+			log.WithField("target", target).WithField("dest", dest).WithField("mode", stat.Mode()).WithError(err).Errorf("cannot get IWS client to mount %s", filesystem)
+			return Errno(unix.EFAULT)
+		}
+		defer iws.Close()
+
+		call := iws.MountProc
+		if filesystem == "sysfs" {
+			call = iws.MountSysfs
+		}
+		_, err = call(ctx, &daemonapi.MountProcRequest{
 			Target: dest,
 			Pid:    int64(req.Pid),
 		})
 		if err != nil {
-			log.WithField("target", target).WithError(err).Error("cannot mount proc")
-			return Errno(unix.EFAULT)
-		}
-
-		return 0, 0, 0
-	}
-
-	if filesystem == "sysfs" {
-		target := filepath.Join(h.Ring2Rootfs, dest)
-		stat, err := os.Lstat(target)
-		if os.IsNotExist(err) {
-			err = os.MkdirAll(target, 0755)
-		}
-		if err != nil {
-			log.WithField("dest", dest).WithError(err).Error("cannot stat mountpoint")
-			return Errno(unix.EFAULT)
-		} else if stat != nil && stat.Mode()&os.ModeDir == 0 {
-			log.WithField("dest", dest).WithError(err).Error("sysfs must be mounted on an ordinary directory")
-			return Errno(unix.EPERM)
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_, err = h.Daemon.MountSysfs(ctx, &daemonapi.MountProcRequest{
-			Target: dest,
-			Pid:    int64(req.Pid),
-		})
-		if err != nil {
-			log.WithField("target", target).WithError(err).Error("cannot mount sysfs")
+			log.WithField("target", dest).WithError(err).Errorf("cannot mount %s", filesystem)
 			return Errno(unix.EFAULT)
 		}
 

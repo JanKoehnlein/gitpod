@@ -5,11 +5,13 @@
 package dart
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/xerrors"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -59,21 +61,21 @@ func Inject(cfg *rest.Config, namespace, targetService string, options ...Inject
 		return nil, err
 	}
 
-	oldService, err := client.CoreV1().Services(namespace).Get(targetService, metav1.GetOptions{})
+	oldService, err := client.CoreV1().Services(namespace).Get(context.Background(), targetService, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
 	log.WithField("name", oldService.Name).Info("target service found")
 
 	// service.Spec.Selector
-	pods, err := client.CoreV1().Pods(namespace).List(metav1.ListOptions{
+	pods, err := client.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
 		LabelSelector: labels.FormatLabels(oldService.Spec.Selector),
 	})
 	if err != nil {
 		return nil, err
 	}
 	if len(pods.Items) == 0 {
-		return nil, fmt.Errorf("found no pods matching the service selector")
+		return nil, xerrors.Errorf("found no pods matching the service selector")
 	}
 	originalPod := pods.Items[0]
 	log.WithField("name", originalPod.Name).Info("original pods found")
@@ -123,7 +125,7 @@ func Inject(cfg *rest.Config, namespace, targetService string, options ...Inject
 			},
 		},
 	}
-	_, err = client.AppsV1().Deployments(namespace).Create(newDeployment)
+	_, err = client.AppsV1().Deployments(namespace).Create(context.Background(), newDeployment, metav1.CreateOptions{})
 	if err != nil && !strings.Contains(err.Error(), "already exists") {
 		return nil, err
 	}
@@ -143,7 +145,7 @@ func Inject(cfg *rest.Config, namespace, targetService string, options ...Inject
 		ObjectMeta: *renamedMeta,
 		Spec:       *renamedSpec,
 	}
-	renamedService, err = client.CoreV1().Services(namespace).Create(renamedService)
+	renamedService, err = client.CoreV1().Services(namespace).Create(context.Background(), renamedService, metav1.CreateOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +153,8 @@ func Inject(cfg *rest.Config, namespace, targetService string, options ...Inject
 		deletionPolicy       = metav1.DeletePropagationForeground
 		gracePeriod    int64 = 30
 	)
-	err = client.CoreV1().Services(namespace).Delete(oldService.Name, &metav1.DeleteOptions{PropagationPolicy: &deletionPolicy, GracePeriodSeconds: &gracePeriod})
+	err = client.CoreV1().Services(namespace).Delete(context.Background(), oldService.Name,
+		metav1.DeleteOptions{PropagationPolicy: &deletionPolicy, GracePeriodSeconds: &gracePeriod})
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +199,7 @@ func Inject(cfg *rest.Config, namespace, targetService string, options ...Inject
 		Spec:       *newSpec,
 	}
 	for i := 0; i < 10; i++ {
-		cs, err := client.CoreV1().Services(namespace).Create(newService)
+		cs, err := client.CoreV1().Services(namespace).Create(context.Background(), newService, metav1.CreateOptions{})
 		if err == nil {
 			newService = cs
 			break
@@ -212,7 +215,7 @@ func Inject(cfg *rest.Config, namespace, targetService string, options ...Inject
 	log.WithField("name", newService.Name).Info("new service created")
 
 	err = wait.PollImmediate(1*time.Second, 30*time.Second, func() (bool, error) {
-		depl, err := client.AppsV1().Deployments(namespace).Get(newDeployment.Name, metav1.GetOptions{})
+		depl, err := client.AppsV1().Deployments(namespace).Get(context.Background(), newDeployment.Name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -221,28 +224,33 @@ func Inject(cfg *rest.Config, namespace, targetService string, options ...Inject
 
 	})
 	if err != nil {
-		return nil, fmt.Errorf("cannot wait for proxy pod: %w", err)
+		return nil, xerrors.Errorf("cannot wait for proxy pod: %w", err)
 	}
 	log.Info("proxy pod up and running")
 
-	proxyPods, err := client.CoreV1().Pods(namespace).List(metav1.ListOptions{LabelSelector: metav1.FormatLabelSelector(metav1.SetAsLabelSelector(labels))})
+	proxyPods, err := client.CoreV1().Pods(namespace).List(
+		context.Background(),
+		metav1.ListOptions{
+			LabelSelector: metav1.FormatLabelSelector(metav1.SetAsLabelSelector(labels)),
+		},
+	)
 	if err != nil {
 		return nil, nil
 	}
 	if len(proxyPods.Items) == 0 {
-		return nil, fmt.Errorf("no proxy pod found")
+		return nil, xerrors.Errorf("no proxy pod found")
 	}
 	tppod := proxyPods.Items[0].Name
 
 	tpc, err := NewProxiedToxiproxy(cfg, namespace, tppod)
 	if err != nil {
-		return nil, fmt.Errorf("cannot start proxy: %w", err)
+		return nil, xerrors.Errorf("cannot start proxy: %w", err)
 	}
 
 	for _, p := range oldService.Spec.Ports {
 		_, err := tpc.CreateProxy(targetService, fmt.Sprintf(":%d", p.TargetPort.IntVal), fmt.Sprintf("%s:%d", renamedService.Name, p.Port))
 		if err != nil {
-			return nil, fmt.Errorf("cannot proxy port %d -> %d: %w", p.TargetPort.IntVal, p.Port, err)
+			return nil, xerrors.Errorf("cannot proxy port %d -> %d: %w", p.TargetPort.IntVal, p.Port, err)
 		}
 		log.WithField("port", p.Port).Infof("toxiproxy for port %d -> %d set up", p.TargetPort.IntVal, p.Port)
 	}
@@ -266,7 +274,7 @@ func Remove(cfg *rest.Config, namespace, targetService string) error {
 		return err
 	}
 
-	proxiedService, err := client.CoreV1().Services(namespace).Get(fmt.Sprintf(fmtOriginalService, targetService), metav1.GetOptions{})
+	proxiedService, err := client.CoreV1().Services(namespace).Get(context.Background(), fmt.Sprintf(fmtOriginalService, targetService), metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -276,7 +284,7 @@ func Remove(cfg *rest.Config, namespace, targetService string) error {
 		deletionPolicy       = metav1.DeletePropagationForeground
 		gracePeriod    int64 = 30
 	)
-	err = client.CoreV1().Services(namespace).Delete(targetService, &metav1.DeleteOptions{
+	err = client.CoreV1().Services(namespace).Delete(context.Background(), targetService, metav1.DeleteOptions{
 		GracePeriodSeconds: &gracePeriod,
 		PropagationPolicy:  &deletionPolicy,
 	})
@@ -300,7 +308,7 @@ func Remove(cfg *rest.Config, namespace, targetService string) error {
 		Spec:       *renamedSpec,
 	}
 	for i := 0; i < 10; i++ {
-		_, err = client.CoreV1().Services(namespace).Create(renamedService)
+		_, err = client.CoreV1().Services(namespace).Create(context.Background(), renamedService, metav1.CreateOptions{})
 		if err == nil {
 			break
 		}
@@ -312,14 +320,15 @@ func Remove(cfg *rest.Config, namespace, targetService string) error {
 		}
 		return err
 	}
-	err = client.CoreV1().Services(namespace).Delete(proxiedService.Name, &metav1.DeleteOptions{PropagationPolicy: &deletionPolicy, GracePeriodSeconds: &gracePeriod})
+	err = client.CoreV1().Services(namespace).Delete(context.Background(), proxiedService.Name,
+		metav1.DeleteOptions{PropagationPolicy: &deletionPolicy, GracePeriodSeconds: &gracePeriod})
 	if err != nil {
 		return err
 	}
 	log.WithField("name", proxiedService.Name).Info("original service renamed")
 
 	pdp := fmt.Sprintf(fmtProxyDeployment, targetService)
-	err = client.AppsV1().Deployments(namespace).Delete(pdp, &metav1.DeleteOptions{
+	err = client.AppsV1().Deployments(namespace).Delete(context.Background(), pdp, metav1.DeleteOptions{
 		PropagationPolicy:  &deletionPolicy,
 		GracePeriodSeconds: &gracePeriod,
 	})

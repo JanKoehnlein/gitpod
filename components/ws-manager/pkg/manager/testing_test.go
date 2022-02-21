@@ -18,6 +18,7 @@ import (
 	"github.com/gitpod-io/gitpod/content-service/pkg/layer"
 	"github.com/gitpod-io/gitpod/content-service/pkg/storage"
 	"github.com/gitpod-io/gitpod/ws-manager/api"
+	config "github.com/gitpod-io/gitpod/ws-manager/api/config"
 )
 
 // This file contains test infrastructure for this package. No function in here is meant for consumption outside of tests.
@@ -26,11 +27,9 @@ import (
 //    Because we need to modify package internal state
 //
 
-// forTestingOnlyGetManager creates a workspace manager instance for testing purposes
-func forTestingOnlyGetManager(t *testing.T, objects ...client.Object) *Manager {
-	config := Configuration{
+func forTestingOnlyManagerConfig() config.Configuration {
+	return config.Configuration{
 		Namespace:                "default",
-		SchedulerName:            "workspace-scheduler",
 		SeccompProfile:           "localhost/workspace-default",
 		HeartbeatInterval:        util.Duration(30 * time.Second),
 		WorkspaceHostPath:        "/tmp/workspaces",
@@ -38,21 +37,21 @@ func forTestingOnlyGetManager(t *testing.T, objects ...client.Object) *Manager {
 		WorkspaceURLTemplate:     "{{ .ID }}-{{ .Prefix }}-{{ .Host }}",
 		WorkspacePortURLTemplate: "{{ .WorkspacePort }}-{{ .ID }}-{{ .Prefix }}-{{ .Host }}",
 		RegistryFacadeHost:       "registry-facade:8080",
-		Container: AllContainerConfiguration{
-			Workspace: ContainerConfiguration{
+		Container: config.AllContainerConfiguration{
+			Workspace: config.ContainerConfiguration{
 				Image: "workspace-image",
-				Limits: ResourceConfiguration{
+				Limits: config.ResourceConfiguration{
 					CPU:    "900m",
 					Memory: "1000M",
 				},
-				Requests: ResourceConfiguration{
-					CPU:     "899m",
-					Memory:  "999M",
-					Storage: "5Gi",
+				Requests: config.ResourceConfiguration{
+					CPU:              "899m",
+					EphemeralStorage: "5Gi",
+					Memory:           "999M",
 				},
 			},
 		},
-		Timeouts: WorkspaceTimeoutConfiguration{
+		Timeouts: config.WorkspaceTimeoutConfiguration{
 			AfterClose:          util.Duration(1 * time.Minute),
 			Initialization:      util.Duration(30 * time.Minute),
 			TotalStartup:        util.Duration(45 * time.Minute),
@@ -63,6 +62,11 @@ func forTestingOnlyGetManager(t *testing.T, objects ...client.Object) *Manager {
 			Interrupted:         util.Duration(5 * time.Minute),
 		},
 	}
+}
+
+// forTestingOnlyGetManager creates a workspace manager instance for testing purposes
+func forTestingOnlyGetManager(t *testing.T, objects ...client.Object) *Manager {
+	config := forTestingOnlyManagerConfig()
 
 	testEnv := &envtest.Environment{}
 	cfg, err := testEnv.Start()
@@ -121,7 +125,7 @@ func forTestingOnlyCreateStartWorkspaceContext(manager *Manager, id string, tpe 
 		},
 		Spec: &api.StartWorkspaceSpec{
 			WorkspaceImage: "foobar",
-			IdeImage:       "someide:version.0",
+			IdeImage:       &api.IDEImage{WebRef: "someide:version.0"},
 			Ports:          []*api.PortSpec{},
 			Initializer:    &csapi.WorkspaceInitializer{},
 		},

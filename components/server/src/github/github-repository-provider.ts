@@ -9,7 +9,7 @@ import { injectable, inject } from 'inversify';
 import { User, Repository } from "@gitpod/gitpod-protocol"
 import { GitHubGraphQlEndpoint, GitHubRestApi } from "./api";
 import { RepositoryProvider } from '../repohost/repository-provider';
-import { parseRepoUrl } from '../repohost/repo-url';
+import { RepoURL } from '../repohost/repo-url';
 import { Branch, CommitInfo } from '@gitpod/gitpod-protocol/src/protocol';
 
 @injectable()
@@ -20,7 +20,7 @@ export class GithubRepositoryProvider implements RepositoryProvider {
     async getRepo(user: User, owner: string, repo: string): Promise<Repository> {
         const repository = await this.github.getRepository(user, { owner, repo });
         const cloneUrl = repository.clone_url;
-        const host = parseRepoUrl(cloneUrl)!.host;
+        const host = RepoURL.parseRepoUrl(cloneUrl)!.host;
         const description = repository.description;
         const avatarUrl = repository.owner.avatar_url;
         const webUrl = repository.html_url;
@@ -105,5 +105,44 @@ export class GithubRepositoryProvider implements RepositoryProvider {
     async getCommitInfo(user: User, owner: string, repo: string, ref: string): Promise<CommitInfo | undefined> {
         const commit = await this.github.getCommit(user, { repo, owner, ref });
         return commit;
+    }
+
+    async getUserRepos(user: User): Promise<string[]> {
+        // Hint: Use this to get richer results:
+        //   node {
+        //       nameWithOwner
+        //       shortDescriptionHTML(limit: 120)
+        //       url
+        //   }
+        const result: any = await this.githubQueryApi.runQuery(user, `
+            query {
+                viewer {
+                    repositoriesContributedTo(includeUserRepositories: true, first: 100) {
+                        edges {
+                            node {
+                                url
+                            }
+                        }
+                    }
+                }
+            }`);
+        return (result.data.viewer?.repositoriesContributedTo?.edges || []).map((edge: any) => edge.node.url)
+    }
+
+    async hasReadAccess(user: User, owner: string, repo: string): Promise<boolean> {
+        try {
+            // If you have no "viewerPermission" on a repository you may not read it
+            // Ref: https://docs.github.com/en/graphql/reference/enums#repositorypermission
+            const result: any = await this.githubQueryApi.runQuery(user, `
+                query {
+                    repository(name: "${repo}", owner: "${owner}") {
+                        viewerPermission
+                    }
+                }
+            `);
+            return result.data.repository !== null;
+        } catch (err) {
+            return false;
+        }
     }
 }

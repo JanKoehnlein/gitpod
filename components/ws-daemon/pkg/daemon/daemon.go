@@ -6,6 +6,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 
@@ -20,11 +21,11 @@ import (
 	"github.com/gitpod-io/gitpod/ws-daemon/api"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/container"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/content"
+	"github.com/gitpod-io/gitpod/ws-daemon/pkg/cpulimit"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/diskguard"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/dispatch"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/hosts"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/iws"
-	"github.com/gitpod-io/gitpod/ws-daemon/pkg/resources"
 )
 
 // NewDaemon produces a new daemon
@@ -40,22 +41,22 @@ func NewDaemon(config Config, reg prometheus.Registerer) (*Daemon, error) {
 	if containerRuntime == nil {
 		return nil, xerrors.Errorf("no container runtime configured")
 	}
-	go func() {
-		// TODO(cw): handle this case more gracefully
-		err := <-containerRuntime.Error()
-		log.WithError(err).Fatal("container runtime interface error")
-	}()
 
 	nodename := os.Getenv("NODENAME")
 	if nodename == "" {
 		return nil, xerrors.Errorf("NODENAME env var isn't set")
 	}
 	cgCustomizer := &CgroupCustomizer{}
-	cgCustomizer.WithCgroupBasePath(config.Resources.CGroupsBasePath)
+	cgCustomizer.WithCgroupBasePath(config.Resources.CGroupBasePath)
+	markUnmountFallback, err := NewMarkUnmountFallback(reg)
+	if err != nil {
+		return nil, err
+	}
 	dsptch, err := dispatch.NewDispatch(containerRuntime, clientset, config.Runtime.KubernetesNamespace, nodename,
-		resources.NewDispatchListener(&config.Resources, reg),
-		&Containerd4214Workaround{},
+		cpulimit.NewDispatchListener(&config.Resources, reg),
+		CacheReclaim(config.Resources.CGroupBasePath),
 		cgCustomizer,
+		markUnmountFallback,
 	)
 	if err != nil {
 		return nil, err
@@ -160,6 +161,17 @@ func (d *Daemon) startReadinessSignal() {
 	mux.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if d.hosts != nil && !d.hosts.DidUpdate() {
 			http.Error(w, "host controller not ready yet", http.StatusTooEarly)
+			return
+		}
+
+		isContainerdReady, err := d.dispatch.Runtime.IsContainerdReady(context.Background())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("containerd error: %v", err), http.StatusTooEarly)
+			return
+		}
+
+		if !isContainerdReady {
+			http.Error(w, "containerd is not ready", http.StatusServiceUnavailable)
 			return
 		}
 

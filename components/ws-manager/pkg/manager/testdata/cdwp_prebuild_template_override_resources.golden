@@ -32,7 +32,10 @@
                 "prometheus.io/port": "23000",
                 "prometheus.io/scrape": "true",
                 "seccomp.security.alpha.kubernetes.io/pod": "localhost/workspace-default"
-            }
+            },
+            "finalizers": [
+                "gitpod.io/finalizer"
+            ]
         },
         "spec": {
             "volumes": [
@@ -167,6 +170,7 @@
                             "port": 22999,
                             "scheme": "HTTP"
                         },
+                        "initialDelaySeconds": 3,
                         "timeoutSeconds": 1,
                         "periodSeconds": 1,
                         "successThreshold": 1,
@@ -216,12 +220,25 @@
                     "name": "eu.gcr.io-gitpod"
                 }
             ],
+            "hostname": "foobar",
             "affinity": {
                 "nodeAffinity": {
                     "requiredDuringSchedulingIgnoredDuringExecution": {
                         "nodeSelectorTerms": [
                             {
                                 "matchExpressions": [
+                                    {
+                                        "key": "gitpod.io/workload_workspace_headless",
+                                        "operator": "Exists"
+                                    },
+                                    {
+                                        "key": "gitpod.io/ws-daemon_ready_ns_default",
+                                        "operator": "Exists"
+                                    },
+                                    {
+                                        "key": "gitpod.io/registry-facade_ready_ns_default",
+                                        "operator": "Exists"
+                                    },
                                     {
                                         "key": "gitpod.io/workload_prebuild",
                                         "operator": "In",
@@ -235,7 +252,6 @@
                     }
                 }
             },
-            "schedulerName": "workspace-scheduler",
             "tolerations": [
                 {
                     "key": "node.kubernetes.io/disk-pressure",

@@ -20,7 +20,7 @@ export class MonitoringEndpointsAppEE extends WorkspaceHealthMonitoring {
         monApp.get('/metrics', async (req, res) => {
 	        try {
 		        res.set('Content-Type', register.contentType);
-		        res.end(register.metrics());
+		        res.end(await register.metrics());
 	        } catch (ex) {
     		    res.status(500).end(ex);
 	        }
@@ -36,7 +36,7 @@ export class MonitoringEndpointsAppEE extends WorkspaceHealthMonitoring {
                     res.status(200).send(result);
                 }
             } catch (err) {
-                log.error("failed to check workspace health", err);
+                log.debug("failed to check workspace health", err);
                 res.status(500).send(err);
             }
         });
@@ -45,7 +45,7 @@ export class MonitoringEndpointsAppEE extends WorkspaceHealthMonitoring {
     }
 }
 
-async function checkWorkspaceHealth(ctx: TraceContext, workspaceHealthMonitoring: WorkspaceHealthMonitoring, extra: boolean = false, ) {
+async function checkWorkspaceHealth(ctx: TraceContext, workspaceHealthMonitoring: WorkspaceHealthMonitoring, extra: boolean = false) {
     const span = TraceContext.startSpan("checkWorkspaceHealth", ctx);
     const result = await workspaceHealthMonitoring.probeAllRunningWorkspaces({ span });
     const numUnhealthy = result.map(r => r.ok ? 0 : 1).reduce((acc: number, cur: number) => acc + cur as number, 0);

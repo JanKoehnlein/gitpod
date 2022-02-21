@@ -5,9 +5,13 @@
  */
 
 import { User, Workspace, NamedWorkspaceFeatureFlag } from "./protocol";
+import { FindPrebuildsParams } from "./gitpod-service";
+import { PrebuildWithStatus } from "./teams-projects-protocol"
+import { Project, Team } from "./teams-projects-protocol";
 import { WorkspaceInstance, WorkspaceInstancePhase } from "./workspace-instance";
 import { RoleOrPermission } from "./permission";
 import { AccountStatement } from "./accounting-protocol";
+import { InstallationAdminSettings } from "./installation-admin-protocol";
 
 export interface AdminServer {
     adminGetUsers(req: AdminGetListRequest<User>): Promise<AdminGetListResult<User>>;
@@ -17,11 +21,17 @@ export interface AdminServer {
     adminModifyRoleOrPermission(req: AdminModifyRoleOrPermissionRequest): Promise<User>;
     adminModifyPermanentWorkspaceFeatureFlag(req: AdminModifyPermanentWorkspaceFeatureFlagRequest): Promise<User>;
 
+    adminGetTeamById(id: string): Promise<Team | undefined>;
+
     adminGetWorkspaces(req: AdminGetWorkspacesRequest): Promise<AdminGetListResult<WorkspaceAndInstance>>;
     adminGetWorkspace(id: string): Promise<WorkspaceAndInstance>;
     adminForceStopWorkspace(id: string): Promise<void>;
     adminRestoreSoftDeletedWorkspace(id: string): Promise<void>;
 
+    adminGetProjectsBySearchTerm(req: AdminGetListRequest<Project>): Promise<AdminGetListResult<Project>>;
+    adminGetProjectById(id: string): Promise<Project | undefined>;
+
+    adminFindPrebuilds(params: FindPrebuildsParams): Promise<PrebuildWithStatus[]>;
     adminSetLicense(key: string): Promise<void>;
 
     adminGetAccountStatement(userId: string): Promise<AccountStatement>;
@@ -29,6 +39,9 @@ export interface AdminServer {
     adminIsStudent(userId: string): Promise<boolean>;
     adminAddStudentEmailDomain(userId: string, domain: string): Promise<void>;
     adminGrantExtraHours(userId: string, extraHours: number): Promise<void>;
+
+    adminGetSettings(): Promise<InstallationAdminSettings>
+    adminUpdateSettings(settings: InstallationAdminSettings): Promise<void>
 }
 
 export interface AdminGetListRequest<T> {
@@ -65,7 +78,7 @@ export interface AdminModifyPermanentWorkspaceFeatureFlagRequest {
     }[]
 }
 
-export interface WorkspaceAndInstance extends Omit<Workspace, "id"|"creationTime">, Omit<WorkspaceInstance, "id"|"creationTime"> {
+export interface WorkspaceAndInstance extends Omit<Workspace, "id" | "creationTime">, Omit<WorkspaceInstance, "id" | "creationTime"> {
     workspaceId: string;
     workspaceCreationTime: string;
     instanceId: string;
@@ -78,7 +91,7 @@ export namespace WorkspaceAndInstance {
         return {
             id: wai.workspaceId,
             creationTime: wai.workspaceCreationTime,
-            ... wai
+            ...wai
         };
     }
 
@@ -89,11 +102,17 @@ export namespace WorkspaceAndInstance {
         return {
             id: wai.instanceId,
             creationTime: wai.instanceCreationTime,
-            ... wai
+            ...wai
         };
     }
 }
 
-export interface AdminGetWorkspacesRequest extends AdminGetListRequest<WorkspaceAndInstance> {
-    ownerId?: string
-}
+export type AdminGetWorkspacesRequest = AdminGetListRequest<WorkspaceAndInstance> & AdminGetWorkspacesQuery;
+/** The fields are meant to be used either OR (not combined) */
+export type AdminGetWorkspacesQuery = {
+    /** we use this field in case we have a UUIDv4 and don't know whether it's an (old) workspace or instance id */
+    instanceIdOrWorkspaceId?: string;
+    instanceId?: string;
+    workspaceId?: string;
+    ownerId?: string;
+};

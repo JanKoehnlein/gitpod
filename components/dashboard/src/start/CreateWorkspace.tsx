@@ -6,17 +6,18 @@
 
 import EventEmitter from "events";
 import React, { useEffect, Suspense, useContext, useState } from "react";
-import { CreateWorkspaceMode, WorkspaceCreationResult, RunningWorkspacePrebuildStarting } from "@gitpod/gitpod-protocol";
+import { CreateWorkspaceMode, WorkspaceCreationResult, RunningWorkspacePrebuildStarting, ContextURL } from "@gitpod/gitpod-protocol";
 import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
 import Modal from "../components/Modal";
 import { getGitpodService, gitpodHostUrl } from "../service/service";
 import { UserContext } from "../user-context";
 import { StartPage, StartPhase, StartWorkspaceError } from "./StartPage";
-import StartWorkspace from "./StartWorkspace";
+import StartWorkspace, { parseProps } from "./StartWorkspace";
 import { openAuthorizeWindow } from "../provider-utils";
 import { SelectAccountPayload } from "@gitpod/gitpod-protocol/lib/auth";
 import { SelectAccountModal } from "../settings/SelectAccountModal";
 import { watchHeadlessLogs } from "../components/PrebuildLogs";
+import CodeText from "../components/CodeText";
 
 const WorkspaceLogs = React.lazy(() => import('../components/WorkspaceLogs'));
 
@@ -113,7 +114,7 @@ export default class CreateWorkspace extends React.Component<CreateWorkspaceProp
       switch (error.code) {
         case ErrorCodes.CONTEXT_PARSE_ERROR:
           statusMessage = <div className="text-center">
-            <p className="text-base mt-2">Learn more about <a className="text-blue" href="https://www.gitpod.io/docs/context-urls/">supported context URLs</a></p>
+            <p className="text-base mt-2">Are you trying to open a Git repository from a self-hosted instance? <a className="text-blue" href={gitpodHostUrl.asAccessControl().toString()}>Add integration</a></p>
           </div>;
           break;
         case ErrorCodes.INVALID_GITPOD_YML:
@@ -128,17 +129,14 @@ export default class CreateWorkspace extends React.Component<CreateWorkspaceProp
             }}>Authorize with {error.data.host}</button>
           </div>;
           break;
+        case ErrorCodes.PERMISSION_DENIED:
+          statusMessage = <p className="text-base text-gitpod-red w-96">Access is not allowed</p>;
+          break;
         case ErrorCodes.USER_BLOCKED:
           window.location.href = '/blocked';
           return;
         case ErrorCodes.NOT_FOUND:
           return <RepositoryNotFoundView error={error} />;
-        case ErrorCodes.PLAN_DOES_NOT_ALLOW_PRIVATE_REPOS:
-          // HACK: Hide the error (behind the modal)
-          error = undefined;
-          phase = StartPhase.Stopped;
-          statusMessage = <LimitReachedPrivateRepoModal />;
-          break;
         case ErrorCodes.TOO_MANY_RUNNING_WORKSPACES:
           // HACK: Hide the error (behind the modal)
           error = undefined;
@@ -159,7 +157,7 @@ export default class CreateWorkspace extends React.Component<CreateWorkspaceProp
 
     const result = this.state?.result;
     if (result?.createdWorkspaceId) {
-      return <StartWorkspace workspaceId={result.createdWorkspaceId} />;
+      return <StartWorkspace {...parseProps(result?.createdWorkspaceId, window.location.search)} />;
     }
 
     else if (result?.existingWorkspaces) {
@@ -168,14 +166,17 @@ export default class CreateWorkspace extends React.Component<CreateWorkspaceProp
         <div className="border-t border-b border-gray-200 dark:border-gray-800 mt-4 -mx-6 px-6 py-2">
           <p className="mt-1 mb-2 text-base">You already have running workspaces with the same context. You can open an existing one or open a new workspace.</p>
           <>
-            {result?.existingWorkspaces?.map(w =>
-              <a href={w.latestInstance?.ideUrl} className="rounded-xl group hover:bg-gray-100 dark:hover:bg-gray-800 flex p-3 my-1">
-                <div className="w-full">
-                  <p className="text-base text-black dark:text-gray-100 font-bold">{w.workspace.id}</p>
-                  <p>{w.workspace.contextURL}</p>
-                </div>
-              </a>
-            )}
+            {result?.existingWorkspaces?.map(w => {
+              const normalizedContextUrl = ContextURL.getNormalizedURL(w.workspace)?.toString() || "undefined";
+              return (
+                <a href={w.latestInstance?.ideUrl || gitpodHostUrl.with({ pathname: '/start/', hash: '#' + w.latestInstance?.workspaceId }).toString()} className="rounded-xl group hover:bg-gray-100 dark:hover:bg-gray-800 flex p-3 my-1">
+                  <div className="w-full">
+                    <p className="text-base text-black dark:text-gray-100 font-bold">{w.workspace.id}</p>
+                    <p className="truncate" title={normalizedContextUrl}>{normalizedContextUrl}</p>
+                  </div>
+                </a>
+              );
+            })}
           </>
         </div>
         <div className="flex justify-end mt-6">
@@ -227,27 +228,23 @@ function LimitReachedModal(p: { children: React.ReactNode }) {
 
 function LimitReachedParallelWorkspacesModal() {
   return <LimitReachedModal>
-    <p className="mt-1 mb-2 text-base">You have reached the limit of parallel running workspaces for your account. Please, upgrade or stop one of the running workspaces.</p>
-  </LimitReachedModal>;
-}
-
-function LimitReachedPrivateRepoModal() {
-  return <LimitReachedModal>
-    <p className="mt-1 mb-2 text-base">Gitpod is free for public repositories. To work with private repositories, please upgrade to a compatible paid plan.</p>
+    <p className="mt-1 mb-2 text-base dark:text-gray-400">You have reached the limit of parallel running workspaces for your account. Please, upgrade or stop one of the running workspaces.</p>
   </LimitReachedModal>;
 }
 
 function LimitReachedOutOfHours() {
   return <LimitReachedModal>
-    <p className="mt-1 mb-2 text-base">You have reached the limit of monthly workspace hours for your account. Please upgrade to get more hours for your workspaces.</p>
+    <p className="mt-1 mb-2 text-base dark:text-gray-400">You have reached the limit of monthly workspace hours for your account. Please upgrade to get more hours for your workspaces.</p>
   </LimitReachedModal>;
 }
 
 function RepositoryNotFoundView(p: { error: StartWorkspaceError }) {
   const [statusMessage, setStatusMessage] = useState<React.ReactNode>();
+  const { host, owner, repoName, userIsOwner, userScopes, lastUpdate } = p.error.data;
+  const repoFullName = (owner && repoName) ? `${owner}/${repoName}` : '';
+
   useEffect(() => {
     (async () => {
-      const { host, owner, repoName, userIsOwner, userScopes, lastUpdate } = p.error.data;
       console.log('host', host);
       console.log('owner', owner);
       console.log('repoName', repoName);
@@ -255,17 +252,10 @@ function RepositoryNotFoundView(p: { error: StartWorkspaceError }) {
       console.log('userScopes', userScopes);
       console.log('lastUpdate', lastUpdate);
 
-      if ((await getGitpodService().server.mayAccessPrivateRepo()) === false) {
-        setStatusMessage(<LimitReachedPrivateRepoModal />);
-        return;
-      }
-
       const authProvider = (await getGitpodService().server.getAuthProviders()).find(p => p.host === host);
       if (!authProvider) {
         return;
       }
-
-      const repoFullName = (owner && repoName) ? `${owner}/${repoName}` : '';
 
       // TODO: this should be aware of already granted permissions
       const missingScope = authProvider.host === 'github.com' ? 'repo' : 'read_repository';
@@ -276,15 +266,15 @@ function RepositoryNotFoundView(p: { error: StartWorkspaceError }) {
 
       if (!userScopes.includes(missingScope)) {
         setStatusMessage(<div className="mt-2 flex flex-col space-y-8">
-          <p className="text-base text-gray-400 w-96">The repository '{`${repoFullName}`}' may be private. Please authorize Gitpod to access to private repositories.</p>
-          <a className="mx-auto" href={authorizeURL}><button className="secondary">Grant Access</button></a>
+          <p className="text-base text-gray-400 w-96">The repository may be private. Please authorize Gitpod to access to private repositories.</p>
+          <a className="mx-auto" href={authorizeURL}><button>Grant Access</button></a>
         </div>);
         return;
       }
 
       if (userIsOwner) {
         setStatusMessage(<div className="mt-2 flex flex-col space-y-8">
-          <p className="text-base text-gray-400 w-96">The repository '{`${repoFullName}`}' is not found in your account.</p>
+          <p className="text-base text-gray-400 w-96">The repository was not found in your account.</p>
         </div>);
         return;
       }
@@ -301,22 +291,27 @@ function RepositoryNotFoundView(p: { error: StartWorkspaceError }) {
 
       if (!updatedRecently) {
         setStatusMessage(<div className="mt-2 flex flex-col space-y-8">
-          <p className="text-base text-gray-400 w-96">Permission to access private repositories has been granted. If you are a member of '{owner}', please try to request access for Gitpod.</p>
-          <a className="mx-auto" href={authorizeURL}><button className="secondary">Request Access for Gitpod</button></a>
+          <p className="text-base text-gray-400 w-96">Permission to access private repositories has been granted. If you are a member of <CodeText>{owner}</CodeText>, please try to request access for Gitpod.</p>
+          <a className="mx-auto" href={authorizeURL}><button>Request Access for Gitpod</button></a>
         </div>);
         return;
       }
 
       setStatusMessage(<div className="mt-2 flex flex-col space-y-8">
-        <p className="text-base text-gray-400 w-96">Your access token was updated recently. Please try again if the repository exists and Gitpod was approved for '{owner}'.</p>
-        <a className="mx-auto" href={authorizeURL}><button className="secondary">Try Again</button></a>
+        <p className="text-base text-gray-400 w-96">Your access token was updated recently. Please try again if the repository exists and Gitpod was approved for <CodeText>{owner}</CodeText>.</p>
+        <a className="mx-auto" href={authorizeURL}><button>Try Again</button></a>
       </div>);
     })();
   }, []);
 
-  return <StartPage phase={StartPhase.Checking} error={p.error}>
-    {statusMessage}
-  </StartPage>;
+  return (
+    <StartPage phase={StartPhase.Checking} error={p.error}>
+      <p className="text-base text-gray-400 mt-2">
+        <CodeText>{repoFullName}</CodeText>
+      </p>
+      {statusMessage}
+    </StartPage>
+  );
 }
 
 interface RunningPrebuildViewProps {

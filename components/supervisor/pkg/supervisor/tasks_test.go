@@ -21,8 +21,29 @@ import (
 	"github.com/gitpod-io/gitpod/supervisor/pkg/terminal"
 )
 
-var skipCommand = "echo \"skip\""
-var failCommand = "exit 1"
+var (
+	skipCommand = "echo \"skip\""
+	failCommand = "exit 1"
+)
+
+var exampleEnvVarInputs = &map[string]interface{}{
+	"JSON_ENV_VAR":     map[string]interface{}{"property": "some string"},
+	"JSON_ESCAPED_VAR": "{\"property\":\"some escaped string\"}",
+	"JSON_ARRAY_VAR":   []string{"Hello", "World"},
+	"STRING_ENV_VAR":   "stringEnvironmentVariable",
+	"BOOLEAN_ENV_VAR":  false,
+	"NULL_ENV_VAR":     nil,
+	"NUMBER_ENV_VAR":   10,
+}
+var (
+	testJSONObjectCommand = `test "$JSON_ENV_VAR" == '{"property":"some string"}'`
+	testEscapedJSONObject = `test "$JSON_ESCAPED_VAR" == '{"property":"some escaped string"}'`
+	testJSONArrayCommand  = `test "$JSON_ARRAY_VAR" == "[\"Hello\",\"World\"]"`
+	testStringEnvCommand  = `test "$STRING_ENV_VAR" == "stringEnvironmentVariable"`
+	testBooleanEnvCommand = `test "$BOOLEAN_ENV_VAR" == false`
+	testNullEnvCommand    = `test "$NULL_ENV_VAR" == null`
+	testNumberEnvCommand  = `test "$NUMBER_ENV_VAR" == 10`
+)
 
 func TestTaskManager(t *testing.T) {
 	log.Log.Logger.SetLevel(logrus.FatalLevel)
@@ -99,6 +120,83 @@ func TestTaskManager(t *testing.T) {
 				Success: false,
 			},
 		},
+		{
+			Desc:        "JSON object converted to plain text object",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testJSONObjectCommand, Env: exampleEnvVarInputs}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
+		{
+			Desc:        "Escaped JSON converts to JSON",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testEscapedJSONObject, Env: exampleEnvVarInputs}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
+		{
+			Desc:        "JSON array is treated as plain array",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testJSONArrayCommand, Env: exampleEnvVarInputs}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
+		{
+			Desc:        "String environment variable is not treated as JSON (extra quotes are stripped)",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testStringEnvCommand, Env: exampleEnvVarInputs}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
+		{
+			Desc:        "Boolean environment variable is treated as a boolean",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testBooleanEnvCommand, Env: exampleEnvVarInputs}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
+		{
+			Desc:        "Null environment variable is treated as null",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testNullEnvCommand, Env: exampleEnvVarInputs}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
+		{
+			Desc:        "Number environment variable is treated as number",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testNumberEnvCommand, Env: exampleEnvVarInputs}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.Desc, func(t *testing.T) {
@@ -132,7 +230,7 @@ func TestTaskManager(t *testing.T) {
 			contentState.MarkContentReady(test.Source)
 			var wg sync.WaitGroup
 			wg.Add(1)
-			tasksSuccessChan := make(chan bool, 1)
+			tasksSuccessChan := make(chan taskSuccess, 1)
 			go taskManager.Run(context.Background(), &wg, tasksSuccessChan)
 			wg.Wait()
 			if diff := cmp.Diff(test.ExpectedReporter, reporter); diff != "" {
@@ -140,7 +238,6 @@ func TestTaskManager(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 type testHeadlessTaskProgressReporter struct {
@@ -151,9 +248,9 @@ type testHeadlessTaskProgressReporter struct {
 func (r *testHeadlessTaskProgressReporter) write(data string, task *task, terminal *terminal.Term) {
 }
 
-func (r *testHeadlessTaskProgressReporter) done(success bool) {
+func (r *testHeadlessTaskProgressReporter) done(success taskSuccess) {
 	r.Done = true
-	r.Success = success
+	r.Success = !success.Failed()
 }
 
 func TestGetTask(t *testing.T) {
@@ -204,6 +301,52 @@ func TestGetTask(t *testing.T) {
 			command := getCommand(&task{config: test.Task, TaskStatus: api.TaskStatus{Id: "0"}}, test.IsHeadless, test.ContentSource, "/")
 			if diff := cmp.Diff(test.Expectation, command); diff != "" {
 				t.Errorf("unexpected getCommand() (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestTaskSuccess(t *testing.T) {
+	type Expectation struct {
+		Failed bool
+		Msg    string
+	}
+
+	tests := []struct {
+		Name        string
+		Input       taskSuccess
+		Expectation Expectation
+	}{
+		{
+			Name:        "task success",
+			Input:       taskSuccessful,
+			Expectation: Expectation{},
+		},
+		{
+			Name:  "task failed",
+			Input: taskFailed("failure"),
+			Expectation: Expectation{
+				Failed: true,
+				Msg:    "failure",
+			},
+		},
+		{
+			Name:  "task composite failed",
+			Input: taskSuccessful.Fail("failed").Fail("some more"),
+			Expectation: Expectation{
+				Failed: true,
+				Msg:    "failed; some more",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.Name, func(t *testing.T) {
+			act := Expectation{
+				Failed: test.Input.Failed(),
+				Msg:    string(test.Input),
+			}
+			if diff := cmp.Diff(test.Expectation, act); diff != "" {
+				t.Errorf("unexpected taskStatus (-want +got):\n%s", diff)
 			}
 		})
 	}

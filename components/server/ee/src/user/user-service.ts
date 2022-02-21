@@ -11,16 +11,20 @@ import { LicenseEvaluator } from "@gitpod/licensor/lib";
 import { Feature } from "@gitpod/licensor/lib/api";
 import { AuthException } from "../../../src/auth/errors";
 import { EligibilityService } from "./eligibility-service";
-import { EnvEE } from "../env";
+import { SubscriptionService } from "@gitpod/gitpod-payment-endpoint/lib/accounting";
+import { OssAllowListDB } from "@gitpod/gitpod-db/lib/oss-allowlist-db";
+import { HostContextProvider } from "../../../src/auth/host-context-provider";
 
 export class UserServiceEE extends UserService {
-    @inject(EnvEE) protected readonly env: EnvEE;
     @inject(LicenseEvaluator) protected readonly licenseEvaluator: LicenseEvaluator;
     @inject(EligibilityService) protected readonly eligibilityService: EligibilityService;
+    @inject(SubscriptionService) protected readonly subscriptionService: SubscriptionService;
+    @inject(OssAllowListDB) protected readonly OssAllowListDb: OssAllowListDB;
+    @inject(HostContextProvider) protected readonly hostContextProvider: HostContextProvider;
 
     async getDefaultWorkspaceTimeout(user: User, date: Date): Promise<WorkspaceTimeoutDuration> {
-        if (this.env.enablePayment) {
-            // the SAAS case
+        if (this.config.enablePayment) {
+            // the SaaS case
             return this.eligibilityService.getDefaultWorkspaceTimeout(user, date);
         }
 
@@ -30,6 +34,14 @@ export class UserServiceEE extends UserService {
         }
 
         return "60m";
+    }
+
+    async userGetsMoreResources(user: User): Promise<boolean> {
+        if (this.config.enablePayment) {
+            return this.eligibilityService.userGetsMoreResources(user);
+        }
+
+        return false;
     }
 
     async checkSignUp(params: CheckSignUpParams) {
@@ -65,4 +77,16 @@ export class UserServiceEE extends UserService {
         return true;
     }
 
+    async checkAutomaticOssEligibility(user: User): Promise<boolean> {
+        const idsWithHost = user.identities.map(id => {
+            const hostContext = this.hostContextProvider.findByAuthProviderId(id.authProviderId);
+            if (!hostContext) {
+                return undefined;
+            }
+            const info = hostContext.authProvider.info;
+            return `${info.host}/${id.authName}`;
+        }).filter(i => !!i) as string[];
+
+        return this.OssAllowListDb.hasAny(idsWithHost);
+    }
 }

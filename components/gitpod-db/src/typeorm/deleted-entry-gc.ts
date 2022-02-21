@@ -7,12 +7,16 @@
 import { injectable, inject } from "inversify";
 import { TypeORM } from "./typeorm";
 import { Config } from "../config";
+import { repeat } from "@gitpod/gitpod-protocol/lib/util/repeat";
+import { Disposable, DisposableCollection } from "@gitpod/gitpod-protocol";
 
 
 @injectable()
-export class DeletedEntryGC {
+export class DeletedEntryGC implements Disposable {
     @inject(TypeORM) protected readonly typeORM: TypeORM;
     @inject(Config) protected readonly config: Config;
+
+    protected readonly disposables = new DisposableCollection();
 
     public start() {
         const cfg = this.config.deletedEntryGCConfig;
@@ -22,9 +26,13 @@ export class DeletedEntryGC {
         }
 
         console.info(`Deleted Entries GC enabled (running every ${cfg.intervalMS/(60*1000)} minutes)`);
-        setInterval(() => {
-            this.gc().catch(e => console.error("error while removing deleted entries", e));
-        }, cfg.intervalMS);
+        this.disposables.push(
+            repeat(() => this.gc().catch(e => console.error("error while removing deleted entries", e)), cfg.intervalMS)
+        );
+    }
+
+    public dispose() {
+        this.disposables.dispose();
     }
 
     protected async gc() {
@@ -46,7 +54,12 @@ const tables: TableWithDeletion[] = [
     { deletionColumn: "deleted", name: "d_b_code_sync_resource" },
     { deletionColumn: "deleted", name: "d_b_team" },
     { deletionColumn: "deleted", name: "d_b_team_membership" },
-    { deletionColumn: "deleted", name: "d_b_project" }
+    { deletionColumn: "deleted", name: "d_b_team_membership_invite" },
+    { deletionColumn: "deleted", name: "d_b_project" },
+    { deletionColumn: "deleted", name: "d_b_prebuild_info" },
+    { deletionColumn: "deleted", name: "d_b_oss_allow_list" },
+    { deletionColumn: "deleted", name: "d_b_project_env_var" },
+    { deletionColumn: "deleted", name: "d_b_project_info" },
 ];
 
 interface TableWithDeletion {

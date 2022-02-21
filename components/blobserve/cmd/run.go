@@ -11,10 +11,13 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/gitpod-io/gitpod/blobserve/pkg/config"
+
 	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/docker/cli/cli/config/configfile"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 
@@ -24,6 +27,7 @@ import (
 )
 
 var jsonLog bool
+var verbose bool
 
 // runCmd represents the run command
 var runCmd = &cobra.Command{
@@ -31,7 +35,7 @@ var runCmd = &cobra.Command{
 	Short: "Starts the blobserve",
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		cfg, err := getConfig(args[0])
+		cfg, err := config.GetConfig(args[0])
 		if err != nil {
 			log.WithError(err).WithField("filename", args[0]).Fatal("cannot load config")
 		}
@@ -80,8 +84,8 @@ var runCmd = &cobra.Command{
 		}
 		if cfg.PrometheusAddr != "" {
 			reg.MustRegister(
-				prometheus.NewGoCollector(),
-				prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
+				collectors.NewGoCollector(),
+				collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 			)
 
 			handler := http.NewServeMux()

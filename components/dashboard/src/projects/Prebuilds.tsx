@@ -5,33 +5,77 @@
  */
 
 import moment from "moment";
-import { PrebuildInfo, PrebuiltWorkspaceState, Project } from "@gitpod/gitpod-protocol";
+import { PrebuildWithStatus, PrebuiltWorkspaceState, Project, WorkspaceInstance } from "@gitpod/gitpod-protocol";
 import { useContext, useEffect, useState } from "react";
-import { useHistory, useLocation, useRouteMatch } from "react-router";
+import { useLocation, useRouteMatch } from "react-router";
 import Header from "../components/Header";
 import DropDown, { DropDownEntry } from "../components/DropDown";
 import { ItemsList, Item, ItemField, ItemFieldContextMenu } from "../components/ItemsList";
+import Spinner from "../icons/Spinner.svg";
+import StatusDone from "../icons/StatusDone.svg";
+import StatusFailed from "../icons/StatusFailed.svg";
+import StatusCanceled from "../icons/StatusCanceled.svg";
+import StatusPaused from "../icons/StatusPaused.svg";
+import StatusRunning from "../icons/StatusRunning.svg";
 import { getGitpodService } from "../service/service";
 import { TeamsContext, getCurrentTeam } from "../teams/teams-context";
 import { ContextMenuEntry } from "../components/ContextMenu";
 import { shortCommitMessage } from "./render-utils";
+import { Link } from "react-router-dom";
+import { Disposable } from "vscode-jsonrpc";
 
-export default function () {
-    const history = useHistory();
-    const { teams } = useContext(TeamsContext);
+export default function (props: { project?: Project, isAdminDashboard?: boolean }) {
     const location = useLocation();
-    const match = useRouteMatch<{ team: string, resource: string }>("/:team/:resource");
-    const projectName = match?.params?.resource;
+
+    const { teams } = useContext(TeamsContext);
     const team = getCurrentTeam(location, teams);
 
-    // @ts-ignore
+    const match = useRouteMatch<{ team: string, resource: string }>("/(t/)?:team/:resource");
+    const projectSlug = props.isAdminDashboard ? props.project?.slug : match?.params?.resource;
+
     const [project, setProject] = useState<Project | undefined>();
-    const [defaultBranch, setDefaultBranch] = useState<string | undefined>();
 
     const [searchFilter, setSearchFilter] = useState<string | undefined>();
     const [statusFilter, setStatusFilter] = useState<PrebuiltWorkspaceState | undefined>();
 
-    const [prebuilds, setPrebuilds] = useState<PrebuildInfo[]>([]);
+    const [isLoadingPrebuilds, setIsLoadingPrebuilds] = useState<boolean>(true);
+    const [prebuilds, setPrebuilds] = useState<PrebuildWithStatus[]>([]);
+
+    useEffect(() => {
+        let registration: Disposable;
+        // Props come from the Admin dashboard and we do not need
+        // the variables generated from route or location
+        if (props.project) {
+            setProject(props.project);
+        }
+        if (!project) {
+            return;
+        }
+        // This call is excluded in the Admin dashboard
+        if (!props.isAdminDashboard) {
+            registration = getGitpodService().registerClient({
+                onPrebuildUpdate: (update: PrebuildWithStatus) => {
+                    if (update.info.projectId === project.id) {
+                        setPrebuilds(prev => [update, ...prev.filter(p => p.info.id !== update.info.id)]);
+                        setIsLoadingPrebuilds(false);
+                    }
+                }
+            });
+        }
+
+        (async () => {
+            setIsLoadingPrebuilds(true);
+            const prebuilds = props && props.isAdminDashboard ?
+                await getGitpodService().server.adminFindPrebuilds({ projectId: project.id })
+                : await getGitpodService().server.findPrebuilds({ projectId: project.id });
+            setPrebuilds(prebuilds);
+            setIsLoadingPrebuilds(false);
+        })();
+
+        if (!props.isAdminDashboard) {
+            return () => { registration.dispose(); }
+        }
+    }, [project]);
 
     useEffect(() => {
         if (!teams) {
@@ -42,38 +86,38 @@ export default function () {
                 ? await getGitpodService().server.getTeamProjects(team.id)
                 : await getGitpodService().server.getUserProjects());
 
-            const project = projectName && projects.find(p => p.name === projectName);
-            if (project) {
-                setProject(project);
+            const newProject = projectSlug && projects.find(
+                p => p.slug ? p.slug === projectSlug :
+                    p.name === projectSlug);
 
-                const prebuilds = await getGitpodService().server.findPrebuilds({ projectId: project.id });
-                setPrebuilds(prebuilds);
-
-                const details = await getGitpodService().server.getProjectOverview(project.id);
-                if (details?.branches) {
-                    setDefaultBranch(details.branches.find(b => b.isDefault)?.name);
-                }
+            if (newProject) {
+                setProject(newProject);
             }
         })();
-    }, [ teams, team ]);
+    }, [projectSlug, team, teams]);
 
-    const prebuildContextMenu = (p: PrebuildInfo) => {
-        const running = p.status === "building";
+    useEffect(() => {
+        if (prebuilds.length === 0) {
+            setIsLoadingPrebuilds(false);
+        }
+    }, [prebuilds])
+
+    const prebuildContextMenu = (p: PrebuildWithStatus) => {
+        const isFailed = p.status === "aborted" || p.status === "timeout" || !!p.error;
+        const isRunning = p.status === "building";
         const entries: ContextMenuEntry[] = [];
-        entries.push({
-            title: "View Prebuild",
-            onClick: () => openPrebuild(p)
-        });
-        entries.push({
-            title: "Trigger Prebuild",
-            onClick: () => triggerPrebuild(p.branch),
-            separator: running
-        });
-        if (running) {
+        if (isFailed) {
+            entries.push({
+                title: `Rerun Prebuild (${p.info.branch})`,
+                onClick: () => triggerPrebuild(p.info.branch),
+                separator: isRunning
+            });
+        }
+        if (isRunning) {
             entries.push({
                 title: "Cancel Prebuild",
                 customFontStyle: 'text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300',
-                onClick: () => window.alert('cancellation not yet supported')
+                onClick: () => cancelPrebuild(p.info.id),
             })
         }
         return entries;
@@ -92,26 +136,38 @@ export default function () {
         return entries;
     }
 
-    const filter = (p: PrebuildInfo) => {
+    const filter = (p: PrebuildWithStatus) => {
         if (statusFilter && statusFilter !== p.status) {
             return false;
         }
-        if (searchFilter && `${p.changeTitle} ${p.branch}`.toLowerCase().includes(searchFilter.toLowerCase()) === false) {
+        if (searchFilter && `${p.info.changeTitle} ${p.info.branch}`.toLowerCase().includes(searchFilter.toLowerCase()) === false) {
             return false;
         }
         return true;
     }
 
-    const filteredPrebuilds = prebuilds.filter(filter);
-
-    const openPrebuild = (pb: PrebuildInfo) => {
-        history.push(`/${!!team ? team.slug : 'projects'}/${projectName}/${pb.id}`);
+    const prebuildSorter = (a: PrebuildWithStatus, b: PrebuildWithStatus) => {
+        if (a.info.startedAt < b.info.startedAt) {
+            return 1;
+        }
+        if (a.info.startedAt === b.info.startedAt) {
+            return 0;
+        }
+        return -1;
     }
 
-    const triggerPrebuild = (branchName: string) => {
-        if (project) {
-            getGitpodService().server.triggerPrebuild(project.id, branchName);
+    const triggerPrebuild = (branchName: string | null) => {
+        if (!project) {
+            return;
         }
+        getGitpodService().server.triggerPrebuild(project.id, branchName);
+    }
+
+    const cancelPrebuild = (prebuildId: string) => {
+        if (!project) {
+            return;
+        }
+        getGitpodService().server.cancelPrebuild(project.id, prebuildId);
     }
 
     const formatDate = (date: string | undefined) => {
@@ -119,9 +175,9 @@ export default function () {
     }
 
     return <>
-        <Header title="Prebuilds" subtitle={`View all recent prebuilds for all active branches.`} />
-        <div className="lg:px-28 px-10">
-            <div className="flex mt-8">
+        {!props.isAdminDashboard && <Header title="Prebuilds" subtitle={`View recent prebuilds for active branches.`} />}
+        <div className={props.isAdminDashboard ? "" : "app-container"}>
+            <div className={props.isAdminDashboard ? "flex" : "flex mt-8"} >
                 <div className="flex">
                     <div className="py-4">
                         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 16 16" width="16" height="16"><path fill="#A8A29E" d="M6 2a4 4 0 100 8 4 4 0 000-8zM0 6a6 6 0 1110.89 3.477l4.817 4.816a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 010 6z" /></svg>
@@ -132,85 +188,171 @@ export default function () {
                 <div className="py-3 pl-3">
                     <DropDown prefix="Prebuild Status: " contextMenuWidth="w-32" entries={statusFilterEntries()} />
                 </div>
-                <button disabled={!defaultBranch} onClick={() => { defaultBranch && triggerPrebuild(defaultBranch) }} className="ml-2">Trigger Prebuild</button>
+                {(!isLoadingPrebuilds && prebuilds.length === 0 && !props.isAdminDashboard) &&
+                    <button onClick={() => triggerPrebuild(null)} className="ml-2">Run Prebuild</button>}
             </div>
             <ItemsList className="mt-2">
                 <Item header={true} className="grid grid-cols-3">
-                    <ItemField>
+                    <ItemField className="my-auto">
                         <span>Prebuild</span>
                     </ItemField>
-                    <ItemField>
+                    <ItemField className="my-auto">
                         <span>Commit</span>
                     </ItemField>
-                    <ItemField>
+                    <ItemField className="my-auto">
                         <span>Branch</span>
-                        <ItemFieldContextMenu />
                     </ItemField>
                 </Item>
-                {filteredPrebuilds.map((p: PrebuildInfo) => <Item className="grid grid-cols-3">
-                    <ItemField className="flex items-center">
-                        <div className="cursor-pointer" onClick={() => openPrebuild(p)}>
+                {isLoadingPrebuilds && <div className="flex items-center justify-center space-x-2 text-gray-400 text-sm pt-16 pb-40">
+                    <img alt="" className="h-4 w-4 animate-spin" src={Spinner} />
+                    <span>Fetching prebuilds...</span>
+                </div>}
+                {prebuilds.filter(filter).sort(prebuildSorter).map((p, index) => <Item key={`prebuild-${p.info.id}`} className="grid grid-cols-3">
+                    <ItemField className={`flex items-center my-auto ${props.isAdminDashboard ? "pointer-events-none" : ""}`}>
+                        <Link to={`/${!!team ? 't/' + team.slug : 'projects'}/${projectSlug}/${p.info.id}`} className="cursor-pointer">
                             <div className="text-base text-gray-900 dark:text-gray-50 font-medium uppercase mb-1">
-                                <div className="inline-block align-text-bottom mr-2 w-4 h-4">{prebuildStatusIcon(p.status)}</div>
-                                {prebuildStatusLabel(p.status)}
+                                <div className="inline-block align-text-bottom mr-2 w-4 h-4">{prebuildStatusIcon(p)}</div>
+                                {prebuildStatusLabel(p)}
                             </div>
-                            <p>{p.startedByAvatar && <img className="rounded-full w-4 h-4 inline-block align-text-bottom mr-2" src={p.startedByAvatar || ''} alt={p.startedBy} />}Triggered {formatDate(p.startedAt)}</p>
+                            <p>{p.info.startedByAvatar && <img className="rounded-full w-4 h-4 inline-block align-text-bottom mr-2" src={p.info.startedByAvatar || ''} alt={p.info.startedBy} />}Triggered {formatDate(p.info.startedAt)}</p>
+                        </Link>
+                    </ItemField>
+                    <ItemField className="flex items-center my-auto">
+                        <div className="truncate">
+                            <div className="text-base text-gray-500 dark:text-gray-50 font-medium mb-1 truncate" title={shortCommitMessage(p.info.changeTitle)}>{shortCommitMessage(p.info.changeTitle)}</div>
+                            <p>{p.info.changeAuthorAvatar && <img className="rounded-full w-4 h-4 inline-block align-text-bottom mr-2" src={p.info.changeAuthorAvatar || ''} alt={p.info.changeAuthor} />}Authored {formatDate(p.info.changeDate)} · {p.info.changeHash?.substring(0, 8)}</p>
                         </div>
                     </ItemField>
-                    <ItemField className="flex items-center">
-                        <div>
-                            <div className="text-base text-gray-500 dark:text-gray-50 font-medium mb-1">{shortCommitMessage(p.changeTitle)}</div>
-                            <p>{p.changeAuthorAvatar && <img className="rounded-full w-4 h-4 inline-block align-text-bottom mr-2" src={p.changeAuthorAvatar || ''} alt={p.changeAuthor} />}Authored {formatDate(p.changeDate)} · {p.changeHash?.substring(0, 8)}</p>
-                        </div>
-                    </ItemField>
-                    <ItemField className="flex items-center">
-                        <div className="flex space-x-2">
-                            <span className="font-medium text-gray-500 dark:text-gray-50">{p.branch}</span>
-                            <span className="text-gray-400">#{p.branchPrebuildNumber}</span>
+                    <ItemField className="flex">
+                        <div className="flex space-x-2 truncate">
+                            <span className="font-medium text-gray-500 dark:text-gray-50 truncate" title={p.info.branch}>{p.info.branch}</span>
                         </div>
                         <span className="flex-grow" />
-                        <ItemFieldContextMenu menuEntries={prebuildContextMenu(p)} />
+                        {!props.isAdminDashboard && <ItemFieldContextMenu menuEntries={prebuildContextMenu(p)} />}
                     </ItemField>
                 </Item>)}
             </ItemsList>
+            {(!isLoadingPrebuilds && prebuilds.length === 0) &&
+                <div className="p-3 text-gray-400 rounded-xl text-sm text-center">No prebuilds found.</div>}
         </div>
 
     </>;
 }
 
-export function prebuildStatusLabel(status: PrebuiltWorkspaceState) {
-    switch (status) {
-        case "aborted":
-            return (<span className="font-medium text-red-500 uppercase">failed</span>);
-        case "available":
-            return (<span className="font-medium text-green-500 uppercase">ready</span>);
-        case "building":
-            return (<span className="font-medium text-blue-500 uppercase">running</span>);
+export function prebuildStatusLabel(prebuild?: PrebuildWithStatus) {
+    switch (prebuild?.status) {
+        case undefined: // Fall through
         case "queued":
             return (<span className="font-medium text-orange-500 uppercase">pending</span>);
-        default:
-            break;
+        case "building":
+            return (<span className="font-medium text-blue-500 uppercase">running</span>);
+        case "aborted":
+            return (<span className="font-medium text-gray-500 uppercase">canceled</span>);
+        case "timeout":
+            return (<span className="font-medium text-red-500 uppercase">failed</span>);
+        case "available":
+            if (prebuild?.error) {
+                return (<span className="font-medium text-red-500 uppercase">failed</span>);
+            }
+            return (<span className="font-medium text-green-500 uppercase">ready</span>);
     }
 }
-export function prebuildStatusIcon(status: PrebuiltWorkspaceState) {
-    switch (status) {
-        case "aborted":
-            return (<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path fill-rule="evenodd" clip-rule="evenodd" d="M8 16C12.4183 16 16 12.4183 16 8C16 3.58172 12.4183 0 8 0C3.58172 0 0 3.58172 0 8C0 12.4183 3.58172 16 8 16ZM6.70711 5.29289C6.31658 4.90237 5.68342 4.90237 5.29289 5.29289C4.90237 5.68342 4.90237 6.31658 5.29289 6.70711L6.58579 8L5.29289 9.29289C4.90237 9.68342 4.90237 10.3166 5.29289 10.7071C5.68342 11.0976 6.31658 11.0976 6.70711 10.7071L8 9.41421L9.29289 10.7071C9.68342 11.0976 10.3166 11.0976 10.7071 10.7071C11.0976 10.3166 11.0976 9.68342 10.7071 9.29289L9.41421 8L10.7071 6.70711C11.0976 6.31658 11.0976 5.68342 10.7071 5.29289C10.3166 4.90237 9.68342 4.90237 9.29289 5.29289L8 6.58579L6.70711 5.29289Z" fill="#F87171" />
-            </svg>)
-        case "available":
-            return (<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path fill-rule="evenodd" clip-rule="evenodd" d="M8 16C12.4183 16 16 12.4183 16 8C16 3.58172 12.4183 0 8 0C3.58172 0 0 3.58172 0 8C0 12.4183 3.58172 16 8 16ZM11.7071 6.70711C12.0976 6.31658 12.0976 5.68342 11.7071 5.29289C11.3166 4.90237 10.6834 4.90237 10.2929 5.29289L7 8.58578L5.7071 7.29289C5.31658 6.90237 4.68342 6.90237 4.29289 7.29289C3.90237 7.68342 3.90237 8.31658 4.29289 8.70711L6.29289 10.7071C6.68342 11.0976 7.31658 11.0976 7.7071 10.7071L11.7071 6.70711Z" fill="#84CC16" />
-            </svg>);
-        case "building":
-            return (<svg width="17" height="16" viewBox="0 0 17 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path fill-rule="evenodd" clip-rule="evenodd" d="M8.99609 16C13.4144 16 16.9961 12.4183 16.9961 8C16.9961 3.58172 13.4144 0 8.99609 0C4.57781 0 0.996094 3.58172 0.996094 8C0.996094 12.4183 4.57781 16 8.99609 16ZM9.99609 4C9.99609 3.44772 9.54837 3 8.99609 3C8.4438 3 7.99609 3.44772 7.99609 4V8C7.99609 8.26522 8.10144 8.51957 8.28898 8.70711L11.1174 11.5355C11.5079 11.9261 12.1411 11.9261 12.5316 11.5355C12.9221 11.145 12.9221 10.5118 12.5316 10.1213L9.99609 7.58579V4Z" fill="#60A5FA" />
-            </svg>);
+
+export function prebuildStatusIcon(prebuild?: PrebuildWithStatus) {
+    switch (prebuild?.status) {
+        case undefined: // Fall through
         case "queued":
-            return (<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path fill-rule="evenodd" clip-rule="evenodd" d="M16 8C16 12.4183 12.4183 16 8 16C3.58172 16 0 12.4183 0 8C0 3.58172 3.58172 0 8 0C12.4183 0 16 3.58172 16 8ZM5 6C5 5.44772 5.44772 5 6 5C6.55228 5 7 5.44772 7 6V10C7 10.5523 6.55228 11 6 11C5.44772 11 5 10.5523 5 10V6ZM10 5C9.44771 5 9 5.44772 9 6V10C9 10.5523 9.44771 11 10 11C10.5523 11 11 10.5523 11 10V6C11 5.44772 10.5523 5 10 5Z" fill="#FBBF24" />
-            </svg>);
-        default:
+            return <img alt="" className="h-4 w-4" src={StatusPaused} />;
+        case "building":
+            return <img alt="" className="h-4 w-4" src={StatusRunning} />;
+        case "aborted":
+            return <img alt="" className="h-4 w-4" src={StatusCanceled} />;
+        case "timeout":
+            return <img alt="" className="h-4 w-4" src={StatusFailed} />;
+        case "available":
+            if (prebuild?.error) {
+                return <img alt="" className="h-4 w-4" src={StatusFailed} />;
+            }
+            return <img alt="" className="h-4 w-4" src={StatusDone} />;
+    }
+}
+
+function formatDuration(milliseconds: number) {
+    const hours = Math.floor(milliseconds / (1000 * 60 * 60));
+    return (hours > 0 ? `${hours}:` : '') + moment(milliseconds).format('mm:ss');
+}
+
+export function PrebuildInstanceStatus(props: { prebuildInstance?: WorkspaceInstance }) {
+    let status = <></>;
+    let details = <></>;
+    switch (props.prebuildInstance?.status.phase) {
+        case undefined: // Fall through
+        case 'preparing': // Fall through
+        case 'pending': // Fall through
+        case 'creating': // Fall through
+        case 'unknown':
+            status = <div className="flex space-x-1 items-center text-yellow-600">
+                <img alt="" className="h-4 w-4" src={StatusPaused} />
+                <span>PENDING</span>
+                </div>;
+            details = <div className="flex space-x-1 items-center text-gray-400">
+                <img alt="" className="h-4 w-4 animate-spin" src={Spinner} />
+                <span>Preparing prebuild ...</span>
+                </div>;
+            break;
+        case 'initializing': // Fall  through
+        case 'running': // Fall through
+        case 'interrupted': // Fall through
+        case 'stopping':
+            status = <div className="flex space-x-1 items-center text-blue-600">
+                <img alt="" className="h-4 w-4" src={StatusRunning} />
+                <span>RUNNING</span>
+                </div>;
+            details = <div className="flex space-x-1 items-center text-gray-400">
+                <img alt="" className="h-4 w-4 animate-spin" src={Spinner} />
+                <span>Prebuild in progress ...</span>
+                </div>;
+            break;
+        case 'stopped':
+            status = <div className="flex space-x-1 items-center text-green-600">
+                <img alt="" className="h-4 w-4" src={StatusDone} />
+                <span>READY</span>
+                </div>;
+            details = <div className="flex space-x-1 items-center text-gray-400">
+                <img alt="" className="h-4 w-4 filter-grayscale" src={StatusRunning} />
+                <span>{!!props.prebuildInstance?.stoppedTime
+                    ? formatDuration((new Date(props.prebuildInstance.stoppedTime).getTime()) - (new Date(props.prebuildInstance.creationTime).getTime()))
+                    : '...'}</span>
+                </div>;
             break;
     }
+    if (props.prebuildInstance?.status.conditions.stoppedByRequest) {
+        status = <div className="flex space-x-1 items-center text-gray-500">
+            <img alt="" className="h-4 w-4" src={StatusCanceled} />
+            <span>CANCELED</span>
+        </div>;
+        details = <div className="flex space-x-1 items-center text-gray-400">
+            <span>Prebuild canceled</span>
+        </div>;
+    } else if (props.prebuildInstance?.status.conditions.failed || props.prebuildInstance?.status.conditions.headlessTaskFailed) {
+        status = <div className="flex space-x-1 items-center text-gitpod-red">
+            <img alt="" className="h-4 w-4" src={StatusFailed} />
+            <span>FAILED</span>
+        </div>;
+        details = <div className="flex space-x-1 items-center text-gray-400">
+            <span>Prebuild failed</span>
+        </div>;
+    } else if (props.prebuildInstance?.status.conditions.timeout) {
+        status = <div className="flex space-x-1 items-center text-gitpod-red">
+            <img alt="" className="h-4 w-4" src={StatusFailed} />
+            <span>FAILED</span>
+        </div>;
+        details = <div className="flex space-x-1 items-center text-gray-400">
+            <span>Prebuild timed out</span>
+        </div>;
+    }
+    return <div className="flex flex-col space-y-1 justify-center text-sm font-semibold">
+        <div>{status}</div>
+        <div>{details}</div>
+    </div>;
 }

@@ -4,7 +4,7 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-import { status } from '@grpc/grpc-js';
+import { status, ServiceError } from '@grpc/grpc-js';
 import fetch from "node-fetch";
 import { User } from '@gitpod/gitpod-protocol/lib/protocol';
 import bodyParser = require('body-parser');
@@ -14,14 +14,14 @@ import { inject, injectable } from 'inversify';
 import { BearerAuth } from '../auth/bearer-authenticator';
 import { isWithFunctionAccessGuard } from '../auth/function-access';
 import { CodeSyncResourceDB, UserStorageResourcesDB, ALL_SERVER_RESOURCES, ServerResource, SyncResource } from '@gitpod/gitpod-db/lib';
-import { BlobServiceClient } from '@gitpod/content-service/lib/blobs_grpc_pb';
 import { DeleteRequest, DownloadUrlRequest, DownloadUrlResponse, UploadUrlRequest, UploadUrlResponse } from '@gitpod/content-service/lib/blobs_pb';
 import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
-import uuid = require('uuid');
+import { v4 as uuidv4 } from 'uuid';
 import { accessCodeSyncStorage, UserRateLimiter } from '../auth/rate-limiter';
 import { increaseApiCallUserCounter } from '../prometheus-metrics';
 import { TheiaPluginService } from '../theia-plugin/theia-plugin-service';
-import { Env } from '../env';
+import { Config } from '../config';
+import { CachingBlobServiceClientProvider } from '@gitpod/content-service/lib/sugar';
 
 // By default: 5 kind of resources * 20 revs * 1Mb = 100Mb max in the content service for user data.
 const defautltRevLimit = 20;
@@ -56,14 +56,14 @@ const userSettingsUri = 'user_storage:settings.json';
 @injectable()
 export class CodeSyncService {
 
-    @inject(Env)
-    private readonly env: Env;
+    @inject(Config)
+    private readonly config: Config;
 
     @inject(BearerAuth)
     private readonly auth: BearerAuth;
 
-    @inject(BlobServiceClient)
-    private readonly blobs: BlobServiceClient;
+    @inject(CachingBlobServiceClientProvider)
+    private readonly blobsProvider: CachingBlobServiceClientProvider;
 
     @inject(CodeSyncResourceDB)
     private readonly db: CodeSyncResourceDB;
@@ -75,11 +75,11 @@ export class CodeSyncService {
     private readonly userStorageResourcesDB: UserStorageResourcesDB;
 
     get apiRouter(): express.Router {
-        const config = this.env.codeSyncConfig;
+        const config = this.config.codeSync;
         const router = express.Router();
         router.use((_, res, next) => {
             // to correlate errors reported by users with errors logged by the server
-            res.setHeader('x-operation-id', uuid.v4());
+            res.setHeader('x-operation-id', uuidv4());
             return next();
         });
         router.use(this.auth.restHandler);
@@ -92,7 +92,7 @@ export class CodeSyncService {
             const id = req.user.id;
             increaseApiCallUserCounter(accessCodeSyncStorage, id);
             try {
-                await UserRateLimiter.instance(this.env.rateLimiter).consume(id, accessCodeSyncStorage);
+                await UserRateLimiter.instance(this.config.rateLimiter).consume(id, accessCodeSyncStorage);
             } catch (e) {
                 if (e instanceof Error) {
                     throw e;
@@ -108,7 +108,6 @@ export class CodeSyncService {
             }
             return next();
         });
-        router.use(bodyParser.text());
         router.get('/v1/manifest', async (req, res) => {
             if (!User.is(req.user)) {
                 res.sendStatus(204);
@@ -152,7 +151,7 @@ export class CodeSyncService {
                 res.sendStatus(204);
                 return;
             }
-            let resourceRev = req.params.ref;
+            let resourceRev: string | undefined = req.params.ref;
             if (resourceRev !== fromTheiaRev) {
                 resourceRev = (await this.db.getResource(req.user.id, resourceKey, resourceRev))?.rev;
             }
@@ -189,7 +188,8 @@ export class CodeSyncService {
                 request.setName(toObjectName(resourceKey, resourceRev));
                 request.setContentType(contentType);
                 try {
-                    const urlResponse = await util.promisify<DownloadUrlRequest, DownloadUrlResponse>(this.blobs.downloadUrl.bind(this.blobs))(request);
+                    const blobsClient = this.blobsProvider.getDefault();
+                    const urlResponse = await util.promisify<DownloadUrlRequest, DownloadUrlResponse>(blobsClient.downloadUrl.bind(blobsClient))(request);
                     const response = await fetch(urlResponse.getUrl(), {
                         headers: {
                             'content-type': contentType
@@ -236,7 +236,8 @@ export class CodeSyncService {
                 request.setOwnerId(userId);
                 request.setName(toObjectName(resourceKey, rev));
                 request.setContentType(contentType);
-                const urlResponse = await util.promisify<UploadUrlRequest, UploadUrlResponse>(this.blobs.uploadUrl.bind(this.blobs))(request);
+                const blobsClient = this.blobsProvider.getDefault();
+                const urlResponse = await util.promisify<UploadUrlRequest, UploadUrlResponse>(blobsClient.uploadUrl.bind(blobsClient))(request);
                 const url = urlResponse.getUrl();
                 const content = req.body as string;
                 const response = await fetch(url, {
@@ -256,8 +257,14 @@ export class CodeSyncService {
                 const request = new DeleteRequest();
                 request.setOwnerId(userId);
                 request.setExact(oldObject);
-                this.blobs.delete(request, (err: any) => {
+
+                const blobsClient = this.blobsProvider.getDefault();
+                blobsClient.delete(request, (err: ServiceError | null) => {
                     if (err) {
+                        if (err.code === status.NOT_FOUND) {
+                            // we're good here
+                            return;
+                        }
                         log.error({ userId }, 'code sync: failed to delete', err, { object: oldObject });
                     }
                 });
@@ -281,7 +288,8 @@ export class CodeSyncService {
                 request.setOwnerId(userId);
                 request.setPrefix(objectPrefix);
                 try {
-                    await util.promisify(this.blobs.delete.bind(this.blobs))(request);
+                    const blobsClient = this.blobsProvider.getDefault();
+                    await util.promisify(blobsClient.delete.bind(blobsClient))(request);
                 } catch (e) {
                     log.error({ userId }, 'code sync: failed to delete', e);
                 }

@@ -28,4 +28,15 @@ export interface Configuration {
 
     // maxTimeToRunningPhaseSeconds is the time that we are willing to give a workspce instance in which it has to reach a running state
     maxTimeToRunningPhaseSeconds: number;
+
+    // timeouts configures the timeout behaviour of pre-workspace cluster workspaces
+    timeouts: {
+        metaInstanceCheckIntervalSeconds: number;
+        preparingPhaseSeconds: number;
+        stoppingPhaseSeconds: number;
+        unknownPhaseSeconds: number;
+    }
+
+    // emulatePreparingIntervalSeconds configures how often we check for Workspaces in phase "preparing" for clusters we do not govern
+    emulatePreparingIntervalSeconds: number;
 }

@@ -64,7 +64,8 @@ describe('Basic unidirectional replication', () => {
         ]);
     })
 
-    it('Should replicate with a start date', async () => {
+    it('Should replicate with a start date', async function () {
+        this.timeout(10000);
         await query(source, `INSERT INTO names VALUES ("9fa18735-c43b-4651-81c5-ddfbdee1035c", "Foo", "1970-01-01 00:00:01.001", 0)`)
         await query(source, `INSERT INTO names VALUES ("9fa18735-c43b-4651-81c5-ddfbdee1035d", "Bar", "1980-01-01 00:00:01.001", 0)`)
 
@@ -202,7 +203,7 @@ describe('Basic unidirectional replication', () => {
 
         const sourceMidTargetRepl = container.get(PeriodicReplicator);
         sourceMidTargetRepl.setup(source, [target, middle], 0, undefined);
-        debugger
+        // debugger
         await sourceMidTargetRepl.synchronize(true);
 
         expect(await query(source, 'SELECT * FROM names')).to.deep.equal([

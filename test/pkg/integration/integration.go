@@ -5,160 +5,86 @@
 package integration
 
 import (
-	"archive/tar"
 	"bytes"
 	"context"
-	"flag"
+	"encoding/json"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
 	"net/rpc"
-	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
-	"sync"
-	"testing"
 	"time"
 
-	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/tools/portforward"
-	"k8s.io/client-go/tools/remotecommand"
-	"k8s.io/client-go/transport/spdy"
+	kubectlcp "k8s.io/kubectl/pkg/cmd/cp"
+	kubectlexec "k8s.io/kubectl/pkg/cmd/exec"
+	"sigs.k8s.io/e2e-framework/klient"
 
-	// most of our infra runs on GCP, so it's handy to bake GCP auth support right in
-	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
+	"github.com/gitpod-io/gitpod/test/pkg/integration/common"
 )
 
-const cfgFlagDefault = "$HOME/.kube/config"
-
-var (
-	cfgFlag       = flag.String("kubeconfig", cfgFlagDefault, "path to the kubeconfig file, use \"in-cluster\" to make use of in cluster Kubernetes config")
-	namespaceFlag = flag.String("namespace", "", "namespace to execute the test against. Defaults to the one configured in \"kubeconfig\".")
-	usernameFlag  = flag.String("username", "", "username to execute the tests with. Chooses one automatically if left blank.")
-)
-
-// NewTest produces a new integration test instance
-func NewTest(t *testing.T, timeout time.Duration) (*Test, context.Context) {
-	flag.Parse()
-	kubeconfig := *cfgFlag
-	namespaceOverride := *namespaceFlag
-	username := *usernameFlag
-
-	if kubeconfig == cfgFlagDefault {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			t.Fatal("cannot determine user home dir", err)
-		}
-		kubeconfig = filepath.Join(home, ".kube", "config")
-	} else if kubeconfig == "in-cluster" {
-		kubeconfig = ""
-	}
-
-	restConfig, ns, err := getKubeconfig(kubeconfig)
-	if err != nil {
-		t.Fatal("cannot load kubeconfig", err)
-	}
-	client, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		t.Fatal("cannot connecto Kubernetes", err)
-	}
-
-	if namespaceOverride != "" {
-		ns = namespaceOverride
-	}
-
-	ctx, ctxCancel := context.WithTimeout(context.Background(), timeout)
-	return &Test{
-		t:          t,
-		clientset:  client,
-		restConfig: restConfig,
-		namespace:  ns,
-		ctx:        ctx,
-		ctxCancel:  ctxCancel,
-		username:   username,
-	}, ctx
+type PodExec struct {
+	RestConfig *rest.Config
+	*kubernetes.Clientset
 }
 
-// GetKubeconfig loads kubernetes connection config from a kubeconfig file
-func getKubeconfig(kubeconfig string) (res *rest.Config, namespace string, err error) {
-	if kubeconfig == "" {
-		res, err = rest.InClusterConfig()
-		if err != nil {
-			return
-		}
-
-		var data []byte
-		data, err = os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-		if err != nil {
-			return
-		}
-		namespace = strings.TrimSpace(string(data))
-		return
-	}
-
-	cfg := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		&clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig},
-		&clientcmd.ConfigOverrides{},
-	)
-	namespace, _, err = cfg.Namespace()
-	if err != nil {
-		return nil, "", err
-	}
-
-	res, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-	if err != nil {
-		return nil, namespace, err
-	}
-
-	return res, namespace, nil
-}
-
-// Test encapsulates integration test functionality
-type Test struct {
-	t          *testing.T
-	clientset  kubernetes.Interface
-	restConfig *rest.Config
-	namespace  string
-	ctx        context.Context
-
-	closer    []func() error
-	ctxCancel func()
-	api       *ComponentAPI
-
-	// username contains the string passed to the test per flag. Might be empty.
-	username string
-}
-
-// Done must be called after the test has run. It cleans up instrumentation
-// and modifications made by the test.
-func (it *Test) Done() {
-	it.ctxCancel()
-
-	// Much "defer", we run the closer in reversed order. This way, we can
-	// append to this list quite naturally, and still break things down in
-	// the correct order.
-	for i := len(it.closer) - 1; i >= 0; i-- {
-		err := it.closer[i]()
-		if err != nil {
-			it.t.Logf("cleanup failed: %q", err)
-		}
+func NewPodExec(config rest.Config, clientset *kubernetes.Clientset) *PodExec {
+	config.APIPath = "/api"                                   // Make sure we target /api and not just /
+	config.GroupVersion = &schema.GroupVersion{Version: "v1"} // this targets the core api groups so the url path will be /api/v1
+	config.NegotiatedSerializer = serializer.WithoutConversionCodecFactory{CodecFactory: scheme.Codecs}
+	return &PodExec{
+		RestConfig: &config,
+		Clientset:  clientset,
 	}
 }
 
-// Username returns the username passed to the test per flag. Might be empty.
-func (it *Test) Username() string {
-	return it.username
+func (p *PodExec) PodCopyFile(src string, dst string, containername string) (*bytes.Buffer, *bytes.Buffer, *bytes.Buffer, error) {
+	ioStreams, in, out, errOut := genericclioptions.NewTestIOStreams()
+	copyOptions := kubectlcp.NewCopyOptions(ioStreams)
+	copyOptions.Clientset = p.Clientset
+	copyOptions.ClientConfig = p.RestConfig
+	copyOptions.Container = containername
+	err := copyOptions.Run([]string{src, dst})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("Could not run copy operation: %v", err)
+	}
+	return in, out, errOut, nil
+}
+
+func (p *PodExec) ExecCmd(command []string, podname string, namespace string, containername string) (*bytes.Buffer, *bytes.Buffer, *bytes.Buffer, error) {
+	ioStreams, in, out, errOut := genericclioptions.NewTestIOStreams()
+	execOptions := &kubectlexec.ExecOptions{
+		StreamOptions: kubectlexec.StreamOptions{
+			IOStreams:     ioStreams,
+			Namespace:     namespace,
+			PodName:       podname,
+			ContainerName: containername,
+		},
+
+		Command:   command,
+		Executor:  &kubectlexec.DefaultRemoteExecutor{},
+		PodClient: p.Clientset.CoreV1(),
+		Config:    p.RestConfig,
+	}
+	err := execOptions.Run()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("Could not run exec operation: %v", err)
+	}
+	return in, out, errOut, nil
 }
 
 // InstrumentOption configures an Instrument call
@@ -199,7 +125,7 @@ func WithContainer(container string) InstrumentOption {
 // Defaults to true.
 func WithWorkspacekitLift(lift bool) InstrumentOption {
 	return func(io *instrumentOptions) error {
-		io.WorkspacekitLift = true
+		io.WorkspacekitLift = lift
 		return nil
 	}
 }
@@ -209,46 +135,52 @@ func WithWorkspacekitLift(lift bool) InstrumentOption {
 // If there isn't, we attempt to build `<agentName>_agent/main.go`.
 // The binary is copied to the destination pod, started and port-forwarded. Then we
 // create an RPC client.
-// Test.Done() will stop the agent and port-forwarding.
-func (it *Test) Instrument(component ComponentType, agentName string, opts ...InstrumentOption) (agent *rpc.Client, err error) {
+func Instrument(component ComponentType, agentName string, namespace string, kubeconfig string, client klient.Client, opts ...InstrumentOption) (*rpc.Client, []func() error, error) {
+	var closer []func() error
+
 	options := instrumentOptions{
 		WorkspacekitLift: true,
 	}
 	for _, o := range opts {
 		err := o(&options)
 		if err != nil {
-			return nil, err
+			return nil, closer, err
 		}
 	}
 
 	expectedBinaryName := fmt.Sprintf("gitpod-integration-test-%s-agent", agentName)
 	agentLoc, _ := exec.LookPath(expectedBinaryName)
 	if agentLoc == "" {
-		agentLoc, err = it.buildAgent(agentName)
+		var err error
+		agentLoc, err = buildAgent(agentName)
 		if err != nil {
-			return nil, err
+			return nil, closer, err
 		}
 		defer os.Remove(agentLoc)
-
-		it.t.Log("agent compiled at", agentLoc)
 	}
 
-	podName, containerName, err := it.selectPod(component, options.SPO)
+	podName, containerName, err := selectPod(component, options.SPO, namespace, client)
 	if err != nil {
-		return nil, err
+		return nil, closer, err
 	}
 	tgtFN := filepath.Base(agentLoc)
-	err = it.uploadAgent(agentLoc, tgtFN, podName, containerName)
+
+	clientConfig, err := kubernetes.NewForConfig(client.RESTConfig())
 	if err != nil {
-		return nil, err
+		return nil, closer, err
+	}
+	podExec := NewPodExec(*client.RESTConfig(), clientConfig)
+	_, _, _, err = podExec.PodCopyFile(agentLoc, fmt.Sprintf("%s/%s:/home/gitpod/%s", namespace, podName, tgtFN), containerName)
+	if err != nil {
+		return nil, closer, err
 	}
 
 	localAgentPort, err := getFreePort()
 	if err != nil {
-		return nil, err
+		return nil, closer, err
 	}
 
-	cmd := []string{filepath.Join("/tmp", tgtFN), "-rpc-port", strconv.Itoa(localAgentPort)}
+	cmd := []string{filepath.Join("/home/gitpod/", tgtFN), "-rpc-port", strconv.Itoa(localAgentPort)}
 	if options.WorkspacekitLift {
 		cmd = append([]string{"/.supervisor/workspacekit", "lift"}, cmd...)
 	}
@@ -256,24 +188,24 @@ func (it *Test) Instrument(component ComponentType, agentName string, opts ...In
 	execErrs := make(chan error, 1)
 	go func() {
 		defer close(execErrs)
-		execErr := it.executeAgent(cmd, podName, containerName)
-		if err != nil {
+		execErr := executeAgent(cmd, podName, containerName, namespace, kubeconfig, client)
+		if execErr != nil {
 			execErrs <- execErr
 		}
 	}()
 	select {
-	case err = <-execErrs:
+	case err := <-execErrs:
 		if err != nil {
-			return nil, err
+			return nil, closer, err
 		}
-		return nil, fmt.Errorf("agent stopped unexepectedly")
+		return nil, closer, fmt.Errorf("agent stopped unexepectedly")
 	case <-time.After(1 * time.Second):
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() {
 		if err == nil {
-			it.closer = append(it.closer, func() error {
+			closer = append(closer, func() error {
 				cancel()
 				return nil
 			})
@@ -281,242 +213,94 @@ func (it *Test) Instrument(component ComponentType, agentName string, opts ...In
 			cancel()
 		}
 	}()
-	fwdReady, fwdErr := forwardPort(ctx, it.restConfig, it.namespace, podName, strconv.Itoa(localAgentPort))
+
+	fwdReady, fwdErr := common.ForwardPort(ctx, kubeconfig, namespace, podName, strconv.Itoa(localAgentPort))
 	select {
 	case <-fwdReady:
-	case err = <-execErrs:
+	case err := <-execErrs:
 		if err != nil {
-			return nil, err
+			return nil, closer, err
 		}
 	case err := <-fwdErr:
 		if err != nil {
-			return nil, err
+			return nil, closer, err
 		}
 	}
 
 	var res *rpc.Client
-	for i := 0; i < 10; i++ {
-		res, err = rpc.DialHTTP("tcp", fmt.Sprintf("localhost:%d", localAgentPort))
-		if err != nil && strings.Contains(err.Error(), "unexpected EOF") {
-			time.Sleep(1 * time.Second)
-			continue
+	var lastError error
+	waitErr := wait.PollImmediate(5*time.Second, 1*time.Minute, func() (bool, error) {
+		res, lastError = rpc.DialHTTP("tcp", fmt.Sprintf("localhost:%d", localAgentPort))
+		if lastError != nil {
+			return false, nil
 		}
 
-		break
+		return true, nil
+	})
+	if waitErr == wait.ErrWaitTimeout {
+		return nil, closer, xerrors.Errorf("timed out attempting to connect agent: %v", lastError)
 	}
-	if err != nil {
-		return nil, err
+	if waitErr != nil {
+		return nil, closer, err
 	}
 
-	it.closer = append(it.closer, func() error {
+	closer = append(closer, func() error {
 		err := res.Call(MethodTestAgentShutdown, new(TestAgentShutdownRequest), new(TestAgentShutdownResponse))
 		if err != nil && strings.Contains(err.Error(), "connection is shut down") {
 			return nil
 		}
+
 		if err != nil {
-			return fmt.Errorf("cannot shutdown agent: %w", err)
+			return xerrors.Errorf("cannot shutdown agent: %w", err)
 		}
 		return nil
 	})
 
-	return res, nil
-}
-
-func (it *Test) Child(t *testing.T) *Test {
-	ctx, cancel := context.WithCancel(it.ctx)
-	res := &Test{
-		t:          t,
-		clientset:  it.clientset,
-		restConfig: it.restConfig,
-		namespace:  it.namespace,
-		ctx:        ctx,
-		ctxCancel:  cancel,
-		api:        it.api,
-		username:   it.username,
-	}
-	it.closer = append(it.closer, func() error { res.Done(); return nil })
-	return res
+	return res, closer, nil
 }
 
 func getFreePort() (int, error) {
-	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
-	if err != nil {
-		return 0, err
-	}
-
-	l, err := net.ListenTCP("tcp", addr)
+	l, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		return 0, err
 	}
 	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
+
+	result, err := net.ResolveTCPAddr("tcp", l.Addr().String())
+	if err != nil {
+		return 0, err
+	}
+
+	return result.Port, nil
 }
 
-// ForwardPort establishes a TCP port forwarding to a Kubernetes pod
-func forwardPort(ctx context.Context, config *rest.Config, namespace, pod, port string) (readychan chan struct{}, errchan chan error) {
-	errchan = make(chan error, 1)
-	readychan = make(chan struct{}, 1)
+func executeAgent(cmd []string, pod, container string, namespace string, kubeconfig string, client klient.Client) error {
+	// since we are self signing certs for gitpod components, pass insecure flag
+	args := []string{"exec", pod, fmt.Sprintf("--namespace=%v", namespace), "--insecure-skip-tls-verify=true", fmt.Sprintf("--kubeconfig=%v", kubeconfig)}
+	if len(container) > 0 {
+		args = append(args, fmt.Sprintf("--container=%s", container))
+	}
+	args = append(args, "--")
+	args = append(args, cmd...)
 
-	roundTripper, upgrader, err := spdy.RoundTripperFor(config)
+	command := exec.Command("kubectl", args...)
+	out, err := command.CombinedOutput()
 	if err != nil {
-		errchan <- err
-		return
+		return xerrors.Errorf("cannot run kubectl command: %w\n%v\nargs:%v", err, string(out), args)
 	}
 
-	path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/portforward", namespace, pod)
-	hostIP := strings.TrimPrefix(config.Host, "https://")
-	serverURL := url.URL{Scheme: "https", Path: path, Host: hostIP}
-	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: roundTripper}, http.MethodPost, &serverURL)
-
-	stopChan := make(chan struct{}, 1)
-	fwdReadyChan := make(chan struct{}, 1)
-	out, errOut := new(bytes.Buffer), new(bytes.Buffer)
-	forwarder, err := portforward.New(dialer, []string{port}, stopChan, fwdReadyChan, out, errOut)
-	if err != nil {
-		panic(err)
-	}
-
-	var once sync.Once
-	go func() {
-		err := forwarder.ForwardPorts()
-		if err != nil {
-			errchan <- err
-		}
-		once.Do(func() { close(readychan) })
-	}()
-
-	go func() {
-		select {
-		case <-readychan:
-			// we're out of here
-		case <-ctx.Done():
-			close(stopChan)
-		}
-	}()
-
-	go func() {
-		for range fwdReadyChan {
-		}
-
-		if errOut.Len() != 0 {
-			errchan <- fmt.Errorf(errOut.String())
-			return
-		}
-
-		once.Do(func() { close(readychan) })
-	}()
-
-	return
+	return nil
 }
 
-func (it *Test) executeAgent(cmd []string, pod, container string) (err error) {
-	restClient := it.clientset.CoreV1().RESTClient()
-	req := restClient.Post().
-		Resource("pods").
-		Name(pod).
-		Namespace(it.namespace).
-		SubResource("exec").
-		Param("container", container)
-	req.VersionedParams(&corev1.PodExecOptions{
-		Container: container,
-		Command:   cmd,
-		Stdin:     false,
-		Stdout:    true,
-		Stderr:    true,
-		TTY:       true,
-	}, scheme.ParameterCodec)
-
-	exec, err := remotecommand.NewSPDYExecutor(it.restConfig, "POST", req.URL())
-	if err != nil {
-		return err
-	}
-
-	return exec.Stream(remotecommand.StreamOptions{
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
-		Tty:    true,
-	})
-}
-
-func (it *Test) uploadAgent(srcFN, tgtFN string, pod, container string) (err error) {
-	stat, err := os.Stat(srcFN)
-	if err != nil {
-		return xerrors.Errorf("cannot upload agent: %w", err)
-	}
-	srcIn, err := os.Open(srcFN)
-	if err != nil {
-		return xerrors.Errorf("cannot upload agent: %w", err)
-	}
-	defer srcIn.Close()
-
-	tarIn, tarOut := io.Pipe()
-
-	restClient := it.clientset.CoreV1().RESTClient()
-	req := restClient.Post().
-		Resource("pods").
-		Name(pod).
-		Namespace(it.namespace).
-		SubResource("exec").
-		Param("container", container)
-	req.VersionedParams(&corev1.PodExecOptions{
-		Container: container,
-		Command:   []string{"tar", "-xmf", "-", "-C", "/tmp"},
-		Stdin:     true,
-		Stdout:    false,
-		Stderr:    false,
-		TTY:       false,
-	}, scheme.ParameterCodec)
-
-	exec, err := remotecommand.NewSPDYExecutor(it.restConfig, "POST", req.URL())
-	if err != nil {
-		return xerrors.Errorf("cannot upload agent: %w", err)
-	}
-
-	var eg errgroup.Group
-	eg.Go(func() error {
-		err := exec.Stream(remotecommand.StreamOptions{
-			Stdin: tarIn,
-			Tty:   false,
-		})
-		if err != nil {
-			return xerrors.Errorf("cannot upload agent: %w", err)
-		}
-		return nil
-	})
-	eg.Go(func() error {
-		tarw := tar.NewWriter(tarOut)
-		err = tarw.WriteHeader(&tar.Header{
-			Typeflag: tar.TypeReg,
-			Name:     tgtFN,
-			Size:     stat.Size(),
-			Mode:     0777,
-		})
-		if err != nil {
-			return xerrors.Errorf("cannot upload agent: %w", err)
-		}
-
-		_, err = io.Copy(tarw, srcIn)
-		if err != nil {
-			return xerrors.Errorf("cannot upload agent: %w", err)
-		}
-
-		tarw.Close()
-		tarOut.Close()
-
-		return nil
-	})
-
-	return eg.Wait()
-}
-
-func (t *Test) buildAgent(name string) (loc string, err error) {
+func buildAgent(name string) (loc string, err error) {
 	defer func() {
 		if err != nil {
 			err = xerrors.Errorf("cannot build agent: %w", err)
 		}
 	}()
 
-	src := name + "_agent/main.go"
+	_, filename, _, _ := runtime.Caller(0)
+	src := path.Join(path.Dir(filename), "..", "agent", name, "main.go")
 	if _, err := os.Stat(src); err != nil {
 		return "", err
 	}
@@ -527,56 +311,71 @@ func (t *Test) buildAgent(name string) (loc string, err error) {
 	}
 	f.Close()
 
-	cmd := exec.Command("go", "build", "-o", f.Name(), src)
+	cmd := exec.Command("go", "build", "-trimpath", "-ldflags='-buildid= -w -s'", "-o", f.Name(), src)
 	cmd.Env = append(os.Environ(),
 		"CGO_ENABLED=0",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("%w: %s", err, string(out))
+		return "", xerrors.Errorf("%w: %s", err, string(out))
 	}
 
 	return f.Name(), nil
 }
 
-func (t *Test) selectPod(component ComponentType, options selectPodOptions) (pod string, container string, err error) {
+func selectPod(component ComponentType, options selectPodOptions, namespace string, client klient.Client) (string, string, error) {
 	listOptions := metav1.ListOptions{
 		LabelSelector: "component=" + string(component),
 	}
+
 	if component == ComponentWorkspace && options.InstanceID != "" {
 		listOptions.LabelSelector = "component=workspace,workspaceID=" + options.InstanceID
 	}
+
 	if component == ComponentWorkspaceDaemon && options.InstanceID != "" {
-		var pods *corev1.PodList
-		pods, err = t.clientset.CoreV1().Pods(t.namespace).List(context.Background(), metav1.ListOptions{
-			LabelSelector: "component=workspace,workspaceID=" + options.InstanceID,
+		var pods corev1.PodList
+		err := client.Resources(namespace).List(context.Background(), &pods, func(opts *metav1.ListOptions) {
+			opts.LabelSelector = "component=workspace,workspaceID=" + options.InstanceID
 		})
 		if err != nil {
-			err = xerrors.Errorf("cannot list pods: %w", err)
-			return
+			return "", "", xerrors.Errorf("cannot list pods: %w", err)
 		}
+
 		if len(pods.Items) == 0 {
-			err = xerrors.Errorf("no workspace pod for instance %s", options.InstanceID)
-			return
+			return "", "", xerrors.Errorf("no workspace pod for instance %s", options.InstanceID)
 		}
+
 		listOptions.FieldSelector = "spec.nodeName=" + pods.Items[0].Spec.NodeName
 	}
 
-	pods, err := t.clientset.CoreV1().Pods(t.namespace).List(context.Background(), listOptions)
+	var pods corev1.PodList
+	err := client.Resources(namespace).List(context.Background(), &pods, func(opts *metav1.ListOptions) {
+		opts.LabelSelector = listOptions.LabelSelector
+		if listOptions.FieldSelector != "" {
+			opts.FieldSelector = listOptions.FieldSelector
+		}
+	})
 	if err != nil {
-		err = xerrors.Errorf("cannot list pods: %w", err)
-		return
-	}
-	if len(pods.Items) == 0 {
-		err = xerrors.Errorf("no pods for %s", component)
-		return
-	}
-	p := pods.Items[0]
-	pod = p.Name
-	if len(pods.Items) > 1 {
-		t.t.Logf("found multiple pods for %s, choosing %s", component, pod)
+		return "", "", xerrors.Errorf("cannot list pods: %w", err)
 	}
 
+	if len(pods.Items) == 0 {
+		return "", "", xerrors.Errorf("no pods for %s", component)
+	}
+
+	if len(pods.Items) > 1 {
+		//t.t.Logf("found multiple pods for %s, choosing %s", component, pod)
+	}
+
+	p := pods.Items[0]
+
+	if !isPodRunningReady(p) {
+		return "", "", xerrors.Errorf("pods for component %s is not running", component)
+	}
+
+	pod := p.Name
+
+	var container string
 	if options.Container != "" {
 		var found bool
 		for _, container := range pods.Items[0].Spec.Containers {
@@ -587,38 +386,83 @@ func (t *Test) selectPod(component ComponentType, options selectPodOptions) (pod
 		}
 
 		if !found {
-			err = xerrors.Errorf("no container name %s found", options.Container)
-			return
+			return "", "", xerrors.Errorf("no container name %s found", options.Container)
 		}
 
 		container = options.Container
 	}
 
-	return
+	return pod, container, nil
 }
 
-func envvarFromPod(pods *corev1.PodList, name, containerName string) (value string, err error) {
-	if len(pods.Items) == 0 {
-		return "", xerrors.Errorf("envvarFromPod: no pods found for %s", name)
+// ServerConfigPartial is the subset of server config we're using for integration tests.
+// Ideally we're using a definition derived from the config interface, someday...
+// NOTE: keep in sync with chart/templates/server-configmap.yaml
+type ServerConfigPartial struct {
+	HostURL           string `json:"hostUrl"`
+	WorkspaceDefaults struct {
+		WorkspaceImage string `json:"workspaceImage"`
+	} `json:"workspaceDefaults"`
+	Session struct {
+		Secret string `json:"secret"`
+	} `json:"session"`
+}
+
+func GetServerConfig(namespace string, client klient.Client) (*ServerConfigPartial, error) {
+	var cm corev1.ConfigMap
+	err := client.Resources().Get(context.Background(), "server-config", namespace, &cm)
+	if err != nil {
+		return nil, err
 	}
-	var container *corev1.Container
-	for _, c := range pods.Items[0].Spec.Containers {
-		if c.Name == containerName {
-			cc := c
-			container = &cc
-			break
-		}
+
+	key := "config.json"
+	configJson, ok := cm.Data[key]
+	if !ok {
+		return nil, fmt.Errorf("key %s not found", key)
 	}
-	if container == nil {
-		return "", fmt.Errorf("envvarFromPod: cannot find container %s", containerName)
+
+	var config ServerConfigPartial
+	err = json.Unmarshal([]byte(configJson), &config)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling server config: %v", err)
 	}
-	for _, e := range container.Env {
-		if e.Name == name {
-			value = e.Value
-			break
-		}
+	return &config, nil
+}
+
+// ServerIDEConfigPartial is the subset of server IDE config we're using for integration tests.
+// NOTE: keep in sync with chart/templates/server-ide-configmap.yaml
+type ServerIDEConfigPartial struct {
+	IDEOptions struct {
+		Options struct {
+			Code struct {
+				Image string `json:"image"`
+			} `json:"code"`
+			CodeLatest struct {
+				Image string `json:"image"`
+			} `json:"code-latest"`
+		} `json:"options"`
+	} `json:"ideOptions"`
+}
+
+func GetServerIDEConfig(namespace string, client klient.Client) (*ServerIDEConfigPartial, error) {
+	var cm corev1.ConfigMap
+	err := client.Resources().Get(context.Background(), "server-ide-config", namespace, &cm)
+	if err != nil {
+		return nil, err
 	}
-	return
+
+	key := "config.json"
+	configJson, ok := cm.Data[key]
+	if !ok {
+		return nil, fmt.Errorf("key %s not found", key)
+	}
+
+	var config ServerIDEConfigPartial
+	err = json.Unmarshal([]byte(configJson), &config)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling server IDE config: %v", err)
+	}
+	return &config, nil
 }
 
 // ComponentType denotes a Gitpod component
@@ -638,3 +482,20 @@ const (
 	// ComponentImageBuilder points to the image-builder-mk3
 	ComponentImageBuilderMK3 ComponentType = "image-builder-mk3"
 )
+
+func isPodRunningReady(p corev1.Pod) bool {
+	if p.Status.Phase != corev1.PodRunning {
+		return false
+	}
+
+	return isPodReady(&p.Status)
+}
+func isPodReady(s *corev1.PodStatus) bool {
+	for i := range s.Conditions {
+		if s.Conditions[i].Type == corev1.PodReady {
+			return s.Conditions[i].Status == corev1.ConditionTrue
+		}
+	}
+
+	return false
+}

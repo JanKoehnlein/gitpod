@@ -5,17 +5,21 @@
 package content
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/google/uuid"
+	"github.com/opencontainers/runc/libcontainer/specconv"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opentracing/opentracing-go"
 	"github.com/sirupsen/logrus"
@@ -42,7 +46,17 @@ type RunInitializerOpts struct {
 	UID uint32
 	GID uint32
 
-	OWI map[string]interface{}
+	OWI OWI
+}
+
+type OWI struct {
+	Owner       string
+	WorkspaceID string
+	InstanceID  string
+}
+
+func (o OWI) Fields() map[string]interface{} {
+	return log.OWI(o.Owner, o.WorkspaceID, o.InstanceID)
 }
 
 // errors to be tested with errors.Is
@@ -140,7 +154,7 @@ func RunInitializer(ctx context.Context, destination string, initializer *csapi.
 		IDMappings:    opts.IdMappings,
 		GID:           int(opts.GID),
 		UID:           int(opts.UID),
-		OWI:           opts.OWI,
+		OWI:           opts.OWI.Fields(),
 	}
 	fc, err := json.MarshalIndent(msg, "", "  ")
 	if err != nil {
@@ -151,23 +165,7 @@ func RunInitializer(ctx context.Context, destination string, initializer *csapi.
 		return err
 	}
 
-	cmd := exec.Command("runc", "spec")
-	cmd.Dir = tmpdir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return xerrors.Errorf("cannot create runc spec: %s: %w", string(out), err)
-	}
-
-	cfgFN := filepath.Join(tmpdir, "config.json")
-	var spec specs.Spec
-	fc, err = os.ReadFile(cfgFN)
-	if err != nil {
-		return err
-	}
-	err = json.Unmarshal(fc, &spec)
-	if err != nil {
-		return err
-	}
+	spec := specconv.Example()
 
 	// we assemble the root filesystem from the ws-daemon container
 	for _, d := range []string{"app", "bin", "dev", "etc", "lib", "opt", "sbin", "sys", "usr", "var"} {
@@ -219,27 +217,65 @@ func RunInitializer(ctx context.Context, destination string, initializer *csapi.
 	if err != nil {
 		return err
 	}
-	err = os.WriteFile(cfgFN, fc, 0644)
+	err = os.WriteFile(filepath.Join(tmpdir, "config.json"), fc, 0644)
 	if err != nil {
 		return err
 	}
 
-	var withDebug string
+	args := []string{"--root", "state"}
+
 	if log.Log.Logger.IsLevelEnabled(logrus.DebugLevel) {
-		withDebug = "--debug"
+		args = append(args, "--debug")
 	}
 
-	cmd = exec.Command("runc", "--root", "state", withDebug, "--log-format", "json", "run", "gogogo")
+	var name string
+	if opts.OWI.InstanceID == "" {
+		id, err := uuid.NewRandom()
+		if err != nil {
+			return err
+		}
+		name = "init-rnd-" + id.String()
+	} else {
+		name = "init-ws-" + opts.OWI.InstanceID
+	}
+
+	args = append(args, "--log-format", "json", "run")
+	args = append(args, "--preserve-fds", "1")
+	args = append(args, name)
+
+	errIn, errOut, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	errch := make(chan []byte, 1)
+	go func() {
+		errmsg, _ := ioutil.ReadAll(errIn)
+		errch <- errmsg
+	}()
+
+	var cmdOut bytes.Buffer
+	cmd := exec.Command("runc", args...)
 	cmd.Dir = tmpdir
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = &cmdOut
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
+	cmd.ExtraFiles = []*os.File{errOut}
 	err = cmd.Run()
+	log.FromBuffer(&cmdOut, log.WithFields(opts.OWI.Fields()))
+	errOut.Close()
+
+	var errmsg []byte
+	select {
+	case errmsg = <-errch:
+	case <-time.After(1 * time.Second):
+		errmsg = []byte("failed to read content initializer response")
+	}
 	if err != nil {
 		if exiterr, ok := err.(*exec.ExitError); ok {
-			// The program has exited with an exit code != 0. If it's 42, it was deliberate.
-			if status, ok := exiterr.Sys().(syscall.WaitStatus); ok && status.ExitStatus() == 42 {
-				return fmt.Errorf("content initializer failed")
+			// The program has exited with an exit code != 0. If it's FAIL_CONTENT_INITIALIZER_EXIT_CODE, it was deliberate.
+			if status, ok := exiterr.Sys().(syscall.WaitStatus); ok && status.ExitStatus() == FAIL_CONTENT_INITIALIZER_EXIT_CODE {
+				log.WithError(err).WithField("exitCode", status.ExitStatus()).WithField("args", args).Error("content init failed")
+				return xerrors.Errorf(string(errmsg))
 			}
 		}
 
@@ -288,10 +324,17 @@ func RunInitializerChild() (err error) {
 
 	initSource, err := wsinit.InitializeWorkspace(ctx, "/dst", rs,
 		wsinit.WithInitializer(initializer),
-		wsinit.WithCleanSlate,
 		wsinit.WithMappings(initmsg.IDMappings),
 		wsinit.WithChown(initmsg.UID, initmsg.GID),
+		wsinit.WithCleanSlate,
 	)
+	if err != nil {
+		return err
+	}
+
+	// some workspace content may have a `/dst/.gitpod` file or directory. That would break
+	// the workspace ready file placement (see https://github.com/gitpod-io/gitpod/issues/7694).
+	err = wsinit.EnsureCleanDotGitpodDirectory(ctx, "/dst")
 	if err != nil {
 		return err
 	}
@@ -359,12 +402,12 @@ func (rs *remoteContentStorage) Qualify(name string) string {
 
 // Upload does nothing
 func (rs *remoteContentStorage) Upload(ctx context.Context, source string, name string, opts ...storage.UploadOption) (string, string, error) {
-	return "", "", fmt.Errorf("not implemented")
+	return "", "", xerrors.Errorf("not implemented")
 }
 
 // UploadInstance takes all files from a local location and uploads it to the remote storage
 func (rs *remoteContentStorage) UploadInstance(ctx context.Context, source string, name string, options ...storage.UploadOption) (bucket, obj string, err error) {
-	return "", "", fmt.Errorf("not implemented")
+	return "", "", xerrors.Errorf("not implemented")
 }
 
 // Bucket returns an empty string

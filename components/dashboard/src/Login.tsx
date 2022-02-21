@@ -5,6 +5,7 @@
  */
 
 import { AuthProviderInfo } from "@gitpod/gitpod-protocol";
+import * as GitpodCookie from '@gitpod/gitpod-protocol/lib/util/gitpod-cookie';
 import { useContext, useEffect, useState } from "react";
 import { UserContext } from "./user-context";
 import { TeamsContext } from "./teams/teams-context";
@@ -20,6 +21,7 @@ import customize from "./images/welcome/customize.svg";
 import fresh from "./images/welcome/fresh.svg";
 import prebuild from "./images/welcome/prebuild.svg";
 import exclamation from "./images/exclamation.svg";
+import { getURLHash } from "./App";
 
 
 function Item(props: { icon: string, iconSize?: string, text: string }) {
@@ -31,20 +33,40 @@ function Item(props: { icon: string, iconSize?: string, text: string }) {
 }
 
 export function markLoggedIn() {
-    document.cookie = "gitpod-user=loggedIn;max-age=" + 60 * 60 * 24 * 365;
+    document.cookie = GitpodCookie.generateCookie(window.location.hostname);
 }
 
 export function hasLoggedInBefore() {
-    return document.cookie.match("gitpod-user=loggedIn");
+    return GitpodCookie.isPresent(document.cookie);
+}
+
+export function hasVisitedMarketingWebsiteBefore() {
+    return document.cookie.match("gitpod-marketing-website-visited=true");
 }
 
 export function Login() {
     const { setUser } = useContext(UserContext);
     const { setTeams } = useContext(TeamsContext);
-    const showWelcome = !hasLoggedInBefore();
 
-    const [ authProviders, setAuthProviders ] = useState<AuthProviderInfo[]>([]);
-    const [ errorMessage, setErrorMessage ] = useState<string | undefined>(undefined);
+    const urlHash = getURLHash();
+    let hostFromContext: string | undefined;
+    let repoPathname: string | undefined;
+
+    try {
+        if (urlHash.length > 0) {
+            const url = new URL(urlHash);
+            hostFromContext = url.host;
+            repoPathname = url.pathname;
+        }
+    } catch (error) {
+        // Hash is not a valid URL
+    }
+
+    const [authProviders, setAuthProviders] = useState<AuthProviderInfo[]>([]);
+    const [errorMessage, setErrorMessage] = useState<string | undefined>(undefined);
+    const [providerFromContext, setProviderFromContext] = useState<AuthProviderInfo>();
+
+    const showWelcome = !hasLoggedInBefore() && !hasVisitedMarketingWebsiteBefore() && !urlHash.startsWith("https://");
 
     useEffect(() => {
         (async () => {
@@ -52,8 +74,16 @@ export function Login() {
         })();
     }, [])
 
+    useEffect(() => {
+        if (hostFromContext && authProviders) {
+            const providerFromContext = authProviders.find(provider => provider.host === hostFromContext);
+            setProviderFromContext(providerFromContext);
+        }
+    }, [authProviders]);
+
     const authorizeSuccessful = async (payload?: string) => {
-        updateUser();
+        updateUser().catch(console.error);
+
         // Check for a valid returnTo in payload
         const safeReturnTo = getSafeURLRedirect(payload);
         if (safeReturnTo) {
@@ -64,7 +94,7 @@ export function Login() {
 
     const updateUser = async () => {
         await getGitpodService().reconnect();
-        const [ user, teams ] = await Promise.all([
+        const [user, teams] = await Promise.all([
             getGitpodService().server.getLoggedInUser(),
             getGitpodService().server.getTeams(),
         ]);
@@ -88,7 +118,7 @@ export function Login() {
                     } else {
                         errorMessage = payload.description ? payload.description : `Error: ${payload.error}`;
                         if (payload.error === "email_taken") {
-                            errorMessage = `Email address already exists. Log in using a different provider.`;
+                            errorMessage = `Email address already used in another account. Please log in with ${(payload as any).host}.`;
                         }
                     }
                     setErrorMessage(errorMessage);
@@ -104,8 +134,8 @@ export function Login() {
             <div id="feature-section-column" className="flex max-w-xl h-full mx-auto pt-6">
                 <div className="flex flex-col px-8 my-auto ml-auto">
                     <div className="mb-12">
-                        <img src={gitpod} className="h-8 block dark:hidden" />
-                        <img src={gitpodDark} className="h-8 hidden dark:block" />
+                        <img src={gitpod} className="h-8 block dark:hidden" alt="Gitpod light theme logo" />
+                        <img src={gitpodDark} className="h-8 hidden dark:block" alt="Gitpod dark theme logo" />
                     </div>
                     <div className="mb-10">
                         <h1 className="text-5xl mb-3">Welcome to Gitpod</h1>
@@ -131,21 +161,37 @@ export function Login() {
                 <div className="flex-grow h-100 flex flex-row items-center justify-center" >
                     <div className="rounded-xl px-10 py-10 mx-auto">
                         <div className="mx-auto pb-8">
-                            <img src={gitpodIcon} className="h-16 mx-auto" />
+                            <img src={providerFromContext ? gitpod : gitpodIcon} className="h-14 mx-auto block dark:hidden" alt="Gitpod's logo" />
+                            <img src={providerFromContext ? gitpodDark : gitpodIcon} className="h-14 hidden mx-auto dark:block" alt="Gitpod dark theme logo" />
                         </div>
+
                         <div className="mx-auto text-center pb-8 space-y-2">
-                            <h1 className="text-3xl">Log in{showWelcome ? '' : ' to Gitpod'}</h1>
-                            <h2 className="uppercase text-sm text-gray-400">ALWAYS READY-TO-CODE</h2>
+                            {providerFromContext
+                                ? <>
+                                    <h2 className="text-xl text-black dark:text-gray-50 font-semibold">Open a cloud-based developer environment</h2>
+                                    <h2 className="text-xl">for the repository {repoPathname?.slice(1)}</h2>
+                                </>
+                                : <>
+                                    <h1 className="text-3xl">Log in{showWelcome ? '' : ' to Gitpod'}</h1>
+                                    <h2 className="uppercase text-sm text-gray-400">ALWAYS READY-TO-CODE</h2>
+                                </>}
                         </div>
+
+
                         <div className="flex flex-col space-y-3 items-center">
-                            {authProviders.map(ap => {
-                                return (
+                            {providerFromContext
+                                ?
+                                <button key={"button" + providerFromContext.host} className="btn-login flex-none w-56 h-10 p-0 inline-flex" onClick={() => openLogin(providerFromContext.host)}>
+                                    {iconForAuthProvider(providerFromContext.authProviderType)}
+                                    <span className="pt-2 pb-2 mr-3 text-sm my-auto font-medium truncate overflow-ellipsis">Continue with {simplifyProviderName(providerFromContext.host)}</span>
+                                </button>
+                                :
+                                authProviders.map(ap =>
                                     <button key={"button" + ap.host} className="btn-login flex-none w-56 h-10 p-0 inline-flex" onClick={() => openLogin(ap.host)}>
                                         {iconForAuthProvider(ap.authProviderType)}
                                         <span className="pt-2 pb-2 mr-3 text-sm my-auto font-medium truncate overflow-ellipsis">Continue with {simplifyProviderName(ap.host)}</span>
-                                    </button>
-                                );
-                            })}
+                                    </button>)
+                            }
                         </div>
 
                         {errorMessage && (
@@ -163,7 +209,7 @@ export function Login() {
                 </div>
                 <div className="flex-none mx-auto h-20 text-center">
                     <span className="text-gray-400">
-                        By signing in, you agree to our <a className="learn-more hover:text-gray-600" target="gitpod-terms" href="https://www.gitpod.io/terms/">terms of service</a>.
+                        By signing in, you agree to our <a className="gp-link hover:text-gray-600" target="gitpod-terms" href="https://www.gitpod.io/terms/">terms of service</a>.
                     </span>
                 </div>
             </div>

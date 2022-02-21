@@ -6,12 +6,11 @@
 
 import * as crypto from 'crypto';
 import { inject, injectable } from "inversify";
-import { UserDB, DBUser, WorkspaceDB } from '@gitpod/gitpod-db/lib';
+import { UserDB, DBUser, WorkspaceDB, OneTimeSecretDB } from '@gitpod/gitpod-db/lib';
 import * as express from 'express';
 import { Authenticator } from "../auth/authenticator";
-import { Env } from "../env";
+import { Config } from '../config';
 import { log, LogContext } from '@gitpod/gitpod-protocol/lib/util/logging';
-import { GitpodCookie } from "../auth/gitpod-cookie";
 import { AuthorizationService } from "./authorization-service";
 import { Permission } from "@gitpod/gitpod-protocol/lib/permission";
 import { UserService } from "./user-service";
@@ -27,17 +26,17 @@ import { IAnalyticsWriter } from "@gitpod/gitpod-protocol/lib/analytics";
 import { TosCookie } from "./tos-cookie";
 import { TosFlow } from "../terms/tos-flow";
 import { increaseLoginCounter } from '../../src/prometheus-metrics';
-import * as uuidv4 from 'uuid/v4';
+import { v4 as uuidv4 } from 'uuid';
 import { ScopedResourceGuard } from "../auth/resource-access";
 import { OneTimeSecretServer } from '../one-time-secret-server';
+import { trackSignup } from '../analytics';
 
 @injectable()
 export class UserController {
     @inject(WorkspaceDB) protected readonly workspaceDB: WorkspaceDB;
     @inject(UserDB) protected readonly userDb: UserDB;
     @inject(Authenticator) protected readonly authenticator: Authenticator;
-    @inject(Env) protected readonly env: Env;
-    @inject(GitpodCookie) protected readonly gitpodCookie: GitpodCookie;
+    @inject(Config) protected readonly config: Config;
     @inject(TosCookie) protected readonly tosCookie: TosCookie;
     @inject(AuthorizationService) protected readonly authService: AuthorizationService;
     @inject(UserService) protected readonly userService: UserService;
@@ -46,6 +45,7 @@ export class UserController {
     @inject(SessionHandlerProvider) protected readonly sessionHandlerProvider: SessionHandlerProvider;
     @inject(LoginCompletionHandler) protected readonly loginCompletionHandler: LoginCompletionHandler;
     @inject(OneTimeSecretServer) protected readonly otsServer: OneTimeSecretServer;
+    @inject(OneTimeSecretDB) protected readonly otsDb: OneTimeSecretDB;
 
     get apiRouter(): express.Router {
         const router = express.Router();
@@ -57,7 +57,7 @@ export class UserController {
             if (req.isAuthenticated()) {
                 log.info({ sessionId: req.sessionID }, "(Auth) User is already authenticated.", { 'login-flow': true });
                 // redirect immediately
-                const redirectTo = this.getSafeReturnToParam(req) || this.env.hostUrl.asDashboard().toString();
+                const redirectTo = this.getSafeReturnToParam(req) || this.config.hostUrl.asDashboard().toString();
                 res.redirect(redirectTo);
                 return;
             }
@@ -72,7 +72,7 @@ export class UserController {
             if (redirectToLoginPage) {
                 const returnTo = this.getSafeReturnToParam(req);
                 const search = returnTo ? `returnTo=${returnTo}` : '';
-                const loginPageUrl = this.env.hostUrl.asLogin().with({ search }).toString();
+                const loginPageUrl = this.config.hostUrl.asLogin().with({ search }).toString();
                 log.info(`Redirecting to login ${loginPageUrl}`)
                 res.redirect(loginPageUrl);
                 return;
@@ -80,7 +80,7 @@ export class UserController {
 
             // Make sure, the session is stored before we initialize the OAuth flow
             try {
-                await saveSession(req);
+                await saveSession(req.session);
             } catch (error) {
                 increaseLoginCounter("failed", "unknown")
                 log.error(`Login failed due to session save error; redirecting to /sorry`, { req, error, clientInfo });
@@ -91,13 +91,47 @@ export class UserController {
             this.ensureSafeReturnToParam(req);
             await this.authenticator.authenticate(req, res, next);
         });
+
+        router.get("/login/ots/:userId/:key", async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+            try {
+                const secret = await this.otsDb.get(req.params.key);
+                if (!secret) {
+                    res.sendStatus(401);
+                    return;
+                }
+
+                const user = await this.userDb.findUserById(req.params.userId);
+                if (!user) {
+                    res.sendStatus(404);
+                    return;
+                }
+
+                const secretHash = crypto.createHash('sha256').update(user.id+this.config.session.secret).digest('hex');
+                if (secretHash !== secret) {
+                    res.sendStatus(401);
+                    return;
+                }
+
+                // mimick the shape of a successful login
+                (req.session! as any).passport = { user: user.id };
+
+                // Save session to DB
+                await new Promise<void>((resolve, reject) => req.session!.save(err => (err ? reject(err) : resolve())));
+
+                res.sendStatus(200);
+            } catch (error) {
+                res.sendStatus(500);
+            }
+        });
+
         router.get("/authorize", (req: express.Request, res: express.Response, next: express.NextFunction) => {
             if (!User.is(req.user)) {
                 res.sendStatus(401);
                 return;
             }
             this.ensureSafeReturnToParam(req);
-            this.authenticator.authorize(req, res, next);
+            this.authenticator.authorize(req, res, next)
+                .catch(err => log.error("authenticator.authorize", err));
         });
         router.get("/deauthorize", (req: express.Request, res: express.Response, next: express.NextFunction) => {
             if (!User.is(req.user)) {
@@ -105,15 +139,15 @@ export class UserController {
                 return;
             }
             this.ensureSafeReturnToParam(req);
-            this.authenticator.deauthorize(req, res, next);
+            this.authenticator.deauthorize(req, res, next)
+                .catch(err => log.error("authenticator.deauthorize", err));
         });
-        const branding = this.env.brandingConfig;
         router.get("/logout", async (req: express.Request, res: express.Response, next: express.NextFunction) => {
             const logContext = LogContext.from({ user: req.user, request: req });
             const clientInfo = getRequestingClientInfo(req);
             const logPayload = { session: req.session, clientInfo };
 
-            let redirectToUrl = this.getSafeReturnToParam(req) || branding.redirectUrlAfterLogout || this.env.hostUrl.toString();
+            let redirectToUrl = this.getSafeReturnToParam(req) || this.config.hostUrl.toString();
 
             if (req.isAuthenticated()) {
                 req.logout();
@@ -127,27 +161,11 @@ export class UserController {
             }
 
             // clear cookies
-            this.gitpodCookie.unsetCookie(res);
-            this.sessionHandlerProvider.clearSessionCookie(res, this.env);
+            this.sessionHandlerProvider.clearSessionCookie(res, this.config);
 
             // then redirect
             log.info(logContext, "(Logout) Redirecting...", { redirectToUrl, ...logPayload });
             res.redirect(redirectToUrl);
-        });
-        router.get("/refresh-login", async (req: express.Request, res: express.Response, next: express.NextFunction) => {
-            if (!req.isAuthenticated() || !User.is(req.user)) {
-                res.sendStatus(401);
-                return;
-            }
-
-            // Clean up
-            this.tosCookie.unset(res);
-
-            // This endpoint is necessary as calls over ws (our way of communicating with /api) do not update the browsers cookie
-            req.session!.touch(console.error);  // Update session explicitly, just to be sure
-            // Update `gitpod-user=loggedIn` as well
-            this.gitpodCookie.setCookie(res);
-            res.sendStatus(200);                // Carries up-to-date cookie in 'Set-Cookie' header
         });
         router.get("/auth/workspace-cookie/:instanceID", async (req: express.Request, res: express.Response, next: express.NextFunction) => {
             if (!req.isAuthenticated() || !User.is(req.user)) {
@@ -167,6 +185,18 @@ export class UserController {
             if (!instanceID) {
                 res.sendStatus(400);
                 log.warn("attempted to fetch workspace cookie without instance ID", { instanceId: req.params.instanceID, userId: user.id });
+                return;
+            }
+
+            let cookiePrefix: string = this.config.hostUrl.url.host;
+            cookiePrefix = cookiePrefix.replace(/^https?/, '');
+            [" ", "-", "."].forEach(c => cookiePrefix = cookiePrefix.split(c).join("_"));
+            const name = `_${cookiePrefix}_ws_${instanceID}_owner_`;
+
+            if (!!req.cookies[name]) {
+                // cookie is already set - do nothing. This prevents server from drowning in load
+                // if the dashboard is ill-behaved.
+                res.sendStatus(200);
                 return;
             }
 
@@ -207,22 +237,17 @@ export class UserController {
                 return;
             }
 
-            let cookiePrefix: string = this.env.hostUrl.url.host;
-            cookiePrefix = cookiePrefix.replace(/^https?/, '');
-            [" ", "-", "."].forEach(c => cookiePrefix = cookiePrefix.split(c).join("_"));
-
-            const name = `_${cookiePrefix}_ws_${instanceID}_owner_`;
             res.cookie(name, token, {
                 path: "/",
                 httpOnly: true,
                 secure: true,
                 maxAge: 1000 * 60 * 60 * 24 * 1,    // 1 day
                 sameSite: "lax",                    // default: true. "Lax" needed for cookie to work in the workspace domain.
-                domain: `.${this.env.hostUrl.url.host}`
+                domain: `.${this.config.hostUrl.url.host}`
             });
             res.sendStatus(200);
         });
-        if (this.env.enableLocalApp) {
+        if (this.config.enableLocalApp) {
             router.get("/auth/local-app", async (req: express.Request, res: express.Response, next: express.NextFunction) => {
                 if (!req.isAuthenticated() || !User.is(req.user)) {
                     res.sendStatus(401);
@@ -236,6 +261,7 @@ export class UserController {
                 }
 
                 const rt = req.query.returnTo;
+                // @ts-ignore Type 'ParsedQs' is not assignable
                 if (!rt || !rt.startsWith("localhost:")) {
                     log.error(`auth/local-app: invalid returnTo URL: "${rt}"`)
                     res.sendStatus(400);
@@ -371,7 +397,7 @@ export class UserController {
             this.tosCookie.set(res, tosHints);
 
             log.info(logContext, "(TOS) Redirecting to /tos.", { tosHints, ...logPayload });
-            res.redirect(this.env.hostUrl.with(() => ({ pathname: '/tos/' })).toString());
+            res.redirect(this.config.hostUrl.with(() => ({ pathname: '/tos/' })).toString());
         });
         const tosFlowUserInfo = (tosFlowInfo: TosFlow) => {
             if (TosFlow.WithIdentity.is(tosFlowInfo)) {
@@ -438,7 +464,7 @@ export class UserController {
                 // that no user data remains in the system.
                 log.info(logContext, '(TOS) User did NOT agree. Redirecting to /logout.', logPayload);
 
-                res.redirect(this.env.hostUrl.withApi({ pathname: "/logout" }).toString());
+                res.redirect(this.config.hostUrl.withApi({ pathname: "/logout" }).toString());
                 // todo@alex: consider redirecting to a info page (returnTo param)
 
                 return;
@@ -475,7 +501,7 @@ export class UserController {
                     await this.loginCompletionHandler.complete(req, res, { ...tosFlowInfo });
                 } else {
 
-                    let returnTo = returnToUrl || this.env.hostUrl.asDashboard().toString();
+                    let returnTo = returnToUrl || this.config.hostUrl.asDashboard().toString();
                     res.redirect(returnTo);
                 }
             }
@@ -503,19 +529,10 @@ export class UserController {
 
         await this.userService.updateUserEnvVarsOnLogin(user, envVars);
         await this.userService.acceptCurrentTerms(user);
-        this.analytics.track({
-            userId: user.id,
-            event: "signup",
-            properties: {
-                "auth_provider": user.identities[0].authProviderId,
-                "email": User.getPrimaryEmail(user),
-                "name": user.identities[0].authName,
-                "full_name": user.fullName,
-                "created_at": user.creationDate,
-                "unsubscribed": !user.allowsMarketingCommunication,
-                "blocked": user.blocked
-            }
-        });
+
+        /* no await */ trackSignup(user, req, this.analytics)
+            .catch(err => log.warn({ userId: user.id }, "trackSignup", err));
+
         await this.loginCompletionHandler.complete(req, res, { user, returnToUrl: returnTo, authHost: host });
     }
 
@@ -527,7 +544,7 @@ export class UserController {
     }
 
     protected getSorryUrl(message: string) {
-        return this.env.hostUrl.asSorry(message).toString();
+        return this.config.hostUrl.asSorry(message).toString();
     }
 
     protected async augmentLoginRequest(req: express.Request) {
@@ -538,7 +555,7 @@ export class UserController {
         }
 
         // read current auth provider configs
-        const authProviderConfigs = this.hostContextProvider.getAll().map(hc => hc.authProvider.config);
+        const authProviderConfigs = this.hostContextProvider.getAll().map(hc => hc.authProvider.params);
 
         // Special Context exception
         if (returnToURL) {
@@ -569,7 +586,7 @@ export class UserController {
 
         // If the context URL contains a known auth host, just use this
         if (returnToURL) {
-            // returnToURL –> https://gitpod.io/#https://github.com/theia-ide/theia"
+            // returnToURL -> https://gitpod.io/#https://github.com/theia-ide/theia"
             const hash = decodeURIComponent(new URL(decodeURIComponent(returnToURL)).hash);
             const value = hash.substr(1); // to remove the leading #
             let contextUrlHost: string | undefined;
@@ -598,13 +615,14 @@ export class UserController {
     }
 
     protected getSafeReturnToParam(req: express.Request) {
+        // @ts-ignore Type 'ParsedQs' is not assignable
         const returnToURL: string | undefined = req.query.redirect || req.query.returnTo;
         if (!returnToURL) {
             log.debug({ sessionId: req.sessionID }, "Empty redirect URL");
             return;
         }
 
-        if (this.urlStartsWith(returnToURL, this.env.hostUrl.toString()) || this.urlStartsWith(returnToURL, this.env.brandingConfig.homepage)) {
+        if (this.urlStartsWith(returnToURL, this.config.hostUrl.toString()) || this.urlStartsWith(returnToURL, "https://www.gitpod.io")) {
             return returnToURL
         }
 

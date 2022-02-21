@@ -1,6 +1,7 @@
 {
     "status": {
         "id": "foobas",
+        "status_version": 65536,
         "metadata": {
             "owner": "foobar",
             "meta_id": "metameta",
@@ -18,13 +19,11 @@
                 {
                     "port": 8080
                 }
-            ]
+            ],
+            "ide_image": {}
         },
         "phase": 4,
-        "conditions": {
-            "service_exists": 1,
-            "deployed": 1
-        },
+        "conditions": {},
         "runtime": {
             "node_name": "minikube",
             "pod_name": "ws-foobas",
